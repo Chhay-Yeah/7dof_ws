@@ -1,0 +1,30 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ML model weights (use Git LFS if you need to version these)
+*.pt
+*.pth
+*.onnx
+
+# Secrets / local config
+*.env
+.env.local
