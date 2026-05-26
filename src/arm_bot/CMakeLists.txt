@@ -129,6 +129,21 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(PROGRAMS
+  ${PROJECT_NAME}/drawing_batch_planner.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  ${PROJECT_NAME}/workspace_prober.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  ${PROJECT_NAME}/gz_path_tracer.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 
 # install(PROGRAMS
 #   ${PROJECT_NAME}/move_v2.py

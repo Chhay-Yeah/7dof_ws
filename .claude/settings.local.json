@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Read(//opt/ros/**)",
-      "Bash(lsb_release -a)"
-    ]
-  }
-}
