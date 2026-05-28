@@ -100,7 +100,7 @@ class Joystick(QWidget):
 
         # direction labels: which way drives +/- of each axis, plus the twist
         s = min(self.width(), self.height())
-        p.setPen(QColor("#cfe3ff"))
+        p.setPen(QColor("#ffa726"))   # orange
         f = p.font()
         f.setBold(True)
         f.setPointSize(max(7, int(s * 0.05)))

@@ -121,49 +121,6 @@ class ModeCard(QFrame):
         super().mouseReleaseEvent(e)
 
 
-class GridOverlay(QWidget):
-    """A faint, labelled reference grid drawn on top of its parent — a layout
-    aid so cells can be named (A1, B2, …) when describing arrangement. It's
-    mouse-transparent, so it never blocks the controls underneath. Cell size is
-    fixed in pixels; labels are the spreadsheet-style column letter + row number.
-    """
-
-    def __init__(self, parent: QWidget, step: int = 80) -> None:
-        super().__init__(parent)
-        self.step = step
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        parent.installEventFilter(self)
-        self.setGeometry(parent.rect())
-        self.raise_()
-
-    def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.Resize:
-            self.setGeometry(QRect(0, 0, obj.width(), obj.height()))
-            self.raise_()
-        return False
-
-    def paintEvent(self, _e):
-        p = QPainter(self)
-        w, h = self.width(), self.height()
-        s = self.step
-        p.setPen(QPen(QColor(170, 170, 170, 70), 1))
-        cols = w // s + 1
-        rows = h // s + 1
-        for c in range(cols + 1):
-            p.drawLine(c * s, 0, c * s, h)
-        for r in range(rows + 1):
-            p.drawLine(0, r * s, w, r * s)
-        f = p.font()
-        f.setPointSize(8)
-        p.setFont(f)
-        p.setPen(QColor(210, 210, 210, 150))
-        for c in range(cols):
-            if c >= 26:
-                break
-            for r in range(rows):
-                p.drawText(c * s + 3, r * s + 12, f"{chr(ord('A') + c)}{r + 1}")
-
-
 class TargetRow(QWidget):
     """A saved-target list row: a name label that turns into an in-place edit
     field when the pencil is clicked (no popup), plus the pencil button."""
@@ -208,7 +165,10 @@ class TargetRow(QWidget):
 
 
 TARGET_MIME = "application/x-pendant-target"
-CANVAS_BG = "#1f2227"
+CANVAS_BG = "#6b7178"     # Motion canvas background (gray)
+NODE_BG = "#d8d8d8"       # saved-target fill (dimmed white)
+NODE_BORDER = "#000000"   # saved-target outline (black)
+JOG_AXIS_COLOR = "#ffa726"  # joystick axis label colour (orange)
 
 
 class EdgeItem(QGraphicsPathItem):
@@ -362,8 +322,8 @@ class NodeItem(QGraphicsItem):
 
     def paint(self, p, opt, widget=None):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor("white")))
-        p.setPen(QPen(QColor(CANVAS_BG), 2))
+        p.setBrush(QBrush(QColor(NODE_BG)))
+        p.setPen(QPen(QColor(NODE_BORDER), 2))
         p.drawRoundedRect(QRectF(0, 0, self.W, self.H), 7, 7)
         p.setPen(QColor("#1b1b1b"))
         p.drawText(QRectF(0, 0, self.W, self.H), Qt.AlignmentFlag.AlignCenter, self.name)
@@ -500,10 +460,10 @@ class TargetPaletteItem(QFrame):
         self._name = name
         self.setFixedHeight(38)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        # White box outlined in the canvas colour, dark text (matches the
-        # nodes once dropped on the canvas).
+        # Dimmed-white box outlined in black, dark text (matches the nodes once
+        # dropped on the canvas).
         self.setStyleSheet(
-            f"QFrame {{ background: white; border: 1px solid {CANVAS_BG};"
+            f"QFrame {{ background: {NODE_BG}; border: 1px solid {NODE_BORDER};"
             f" border-radius: 6px; }}"
             " QLabel { color: #1b1b1b; background: transparent; border: none; }"
         )
@@ -537,6 +497,52 @@ class TargetPaletteItem(QFrame):
             drag.exec(Qt.DropAction.CopyAction)
 
 
+class TaskCard(QFrame):
+    """A saved-task tile in the Motion task list. Single click selects it
+    (calls ``on_click``); double click opens it for editing (``on_double``)."""
+
+    def __init__(self, index: int, name: str, subtitle: str,
+                 on_click, on_double) -> None:
+        super().__init__()
+        self._index = index
+        self._on_click = on_click
+        self._on_double = on_double
+        self._selected = False
+        self.setFixedSize(180, 92)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        self._title = QLabel(name)
+        self._title.setStyleSheet("font-weight: bold; font-size: 14px; background: transparent; border: none;")
+        self._title.setWordWrap(True)
+        lay.addWidget(self._title)
+        sub = QLabel(subtitle)
+        sub.setStyleSheet("color: #ccc; font-size: 11px; background: transparent; border: none;")
+        lay.addWidget(sub)
+        lay.addStretch(1)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        border = "#4f9bff" if self._selected else "#565b63"
+        bg = "#343a44" if self._selected else "#2b2f36"
+        self.setStyleSheet(
+            f"TaskCard {{ background: {bg}; border: 2px solid {border};"
+            f" border-radius: 8px; }}"
+        )
+
+    def set_selected(self, sel: bool) -> None:
+        self._selected = sel
+        self._apply_style()
+
+    def mousePressEvent(self, e):
+        self._on_click(self._index)
+        super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self._on_double(self._index)
+        super().mouseDoubleClickEvent(e)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, node: PendantBridge, backend) -> None:
         super().__init__()
@@ -558,6 +564,10 @@ class MainWindow(QMainWindow):
         self.jog_group = 0          # 0 -> joints 1-3, 1 -> joints 4-6
         self._dial7_pending: float | None = None  # joint-7 dial target to flush
         self._target_seq = 0        # running counter for default posN names
+        self._tasks: list[dict] = []   # saved Motion tasks (in-memory only)
+        self._task_seq = 0          # running counter for default task names
+        self._editing_task: int | None = None  # index being edited (None = new)
+        self._selected_task: int | None = None  # index selected in the list view
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -869,7 +879,7 @@ class MainWindow(QMainWindow):
         self.joint7_box.move(760 - 63, 440 - 78)    # (697, 362)
 
         # Control cluster anchored with the Mode selector at K1 (x = 800),
-        # then Joint selector (K2), Speed (K3), axis legend (K4).
+        # then Joint selector (K2), Home (K3), Speed (K4).
         kx = 10 * S
         sel_qss = (
             "QPushButton { border: 2px solid #6a7280; border-radius: 8px;"
@@ -899,10 +909,6 @@ class MainWindow(QMainWindow):
         self.jog_speed.setValue(1.0)
         sl.addWidget(self.jog_speed)
         speed.setGeometry(kx, 6 + 3 * S, 150, 32)
-
-        self.axis_label = QLabel(w)                               # K5
-        self.axis_label.setStyleSheet("font-family: monospace; font-size: 13px;")
-        self.axis_label.setGeometry(kx, 6 + 4 * S, 150, 90)
 
         # Compact set-joint row at D1 (x = 240); joint mode only.
         self.joint_set_box = QWidget(w)
@@ -978,8 +984,6 @@ class MainWindow(QMainWindow):
         self.targets_box.setGeometry(3 * S, 1 * S, 5 * S, 3 * S)  # (240, 80, 400, 240)
 
         self._update_jog_ui()
-        # Temporary layout aid: faint labelled grid over everything on this page.
-        self.jog_grid = GridOverlay(w)
         return w
 
     def _save_target(self) -> None:
@@ -1038,21 +1042,11 @@ class MainWindow(QMainWindow):
         w = QWidget()
         main = QHBoxLayout(w)
 
-        left = QVBoxLayout()
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Task:"))
-        self.task_name = QLineEdit()
-        self.task_name.setPlaceholderText("task name")
-        top.addWidget(self.task_name)
-        new_btn = QPushButton("New")
-        new_btn.clicked.connect(self._motion_new_task)
-        top.addWidget(new_btn)
-        top.addStretch(1)
-        left.addLayout(top)
-        self.motion_canvas = MotionCanvas()
-        self.motion_canvas.scene_.edge_double_clicked = self._on_motion_edge_double
-        left.addWidget(self.motion_canvas, 1)
-        main.addLayout(left, 1)
+        # Left side flips between the flowchart editor and the saved-task list.
+        self.motion_left_stack = QStackedWidget()
+        self.motion_left_stack.addWidget(self._build_motion_editor())     # page 0
+        self.motion_left_stack.addWidget(self._build_task_list_view())    # page 1
+        main.addWidget(self.motion_left_stack, 1)
 
         palette_box = QGroupBox("Targets")
         pv = QVBoxLayout(palette_box)
@@ -1076,11 +1070,205 @@ class MainWindow(QMainWindow):
         main.addWidget(self.motion_side)
         return w
 
+    def _build_motion_editor(self) -> QWidget:
+        w = QWidget()
+        left = QVBoxLayout(w)
+        left.setContentsMargins(0, 0, 0, 0)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Task:"))
+        self.task_name = QLineEdit()
+        self.task_name.setPlaceholderText("task name")
+        top.addWidget(self.task_name)
+        save_btn = QPushButton("Save")
+        save_btn.setStyleSheet(
+            "border: 2px solid #6a7280; border-radius: 6px; background: #3a3f47;"
+            " color: white; padding: 4px 14px;"
+        )
+        save_btn.clicked.connect(self._save_task)
+        top.addWidget(save_btn)
+        new_btn = QPushButton("New")
+        new_btn.clicked.connect(self._motion_new_task)
+        top.addWidget(new_btn)
+        tasks_btn = QPushButton("Tasks")
+        tasks_btn.clicked.connect(self._show_task_list)
+        top.addWidget(tasks_btn)
+        top.addStretch(1)
+        left.addLayout(top)
+        self.motion_canvas = MotionCanvas()
+        self.motion_canvas.scene_.edge_double_clicked = self._on_motion_edge_double
+        left.addWidget(self.motion_canvas, 1)
+        return w
+
+    def _build_task_list_view(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        bar = QHBoxLayout()
+        for label, slot in (
+            ("Create new Task", self._task_create_new),
+            ("Edit", self._task_edit_selected),
+            ("Run", self._task_run_selected),
+            ("Duplicate", self._task_duplicate_selected),
+            ("Delete", self._task_delete_selected),
+        ):
+            b = QPushButton(label)
+            b.clicked.connect(slot)
+            bar.addWidget(b)
+        bar.addStretch(1)
+        v.addLayout(bar)
+
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        inner = QWidget()
+        self.task_grid = QGridLayout(inner)
+        self.task_grid.setSpacing(12)
+        self.task_grid.setContentsMargins(8, 8, 8, 8)
+        self.task_grid.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        area.setWidget(inner)
+        v.addWidget(area, 1)
+        self._task_cards: list[TaskCard] = []
+        return w
+
+    # ── Motion view switching ─────────────────────────────────────────────
+    def _show_motion_editor(self) -> None:
+        self.motion_left_stack.setCurrentIndex(0)
+        self.motion_side.setCurrentIndex(0)
+        self.motion_side.show()
+
+    def _show_task_list(self) -> None:
+        self._refresh_task_list()
+        self.motion_left_stack.setCurrentIndex(1)
+        self.motion_side.hide()
+
     def _motion_new_task(self) -> None:
+        """Reset the editor to a blank task (does not leave the editor)."""
+        self._editing_task = None
+        self._selected_task = None
+        if hasattr(self, "task_name"):
+            self.task_name.clear()
         self.motion_canvas.scene_.clear()
         self._motion_edge = None
         if hasattr(self, "motion_side"):
             self.motion_side.setCurrentIndex(0)
+
+    # ── task (de)serialisation ────────────────────────────────────────────
+    def _serialize_canvas(self):
+        nodes = [it for it in self.motion_canvas.scene_.items()
+                 if isinstance(it, NodeItem)]
+        idx = {n: i for i, n in enumerate(nodes)}
+        node_data = [{"name": n.name, "x": n.pos().x(), "y": n.pos().y()}
+                     for n in nodes]
+        edge_data = []
+        for it in self.motion_canvas.scene_.items():
+            if isinstance(it, EdgeItem) and it.src in idx and it.dst in idx:
+                edge_data.append({"src": idx[it.src], "dst": idx[it.dst],
+                                  "kind": it.kind, "delay": it.delay})
+        return node_data, edge_data
+
+    def _load_task_into_canvas(self, task: dict) -> None:
+        self.motion_canvas.scene_.clear()
+        self._motion_edge = None
+        nodes = []
+        for nd in task["nodes"]:
+            n = NodeItem(nd["name"])
+            self.motion_canvas.scene_.addItem(n)
+            n.setPos(nd["x"], nd["y"])
+            nodes.append(n)
+        for ed in task["edges"]:
+            if ed["src"] < len(nodes) and ed["dst"] < len(nodes):
+                e = EdgeItem(nodes[ed["src"]], nodes[ed["dst"]])
+                e.set_kind(ed["kind"])
+                e.set_delay(ed["delay"])
+
+    def _save_task(self) -> None:
+        node_data, edge_data = self._serialize_canvas()
+        name = self.task_name.text().strip()
+        if not name:
+            self._task_seq += 1
+            name = f"Task {self._task_seq}"
+        task = {"name": name, "nodes": node_data, "edges": edge_data}
+        if self._editing_task is not None and self._editing_task < len(self._tasks):
+            self._tasks[self._editing_task] = task
+            self._selected_task = self._editing_task
+        else:
+            self._tasks.append(task)
+            self._selected_task = len(self._tasks) - 1
+        self._show_task_list()
+
+    # ── task list interactions ────────────────────────────────────────────
+    def _refresh_task_list(self) -> None:
+        while self.task_grid.count():
+            it = self.task_grid.takeAt(0)
+            wdg = it.widget()
+            if wdg is not None:
+                wdg.deleteLater()
+        self._task_cards = []
+        if not self._tasks:
+            lbl = QLabel("No saved tasks yet — build one on the canvas and press Save.")
+            lbl.setStyleSheet("color: #ccc;")
+            self.task_grid.addWidget(lbl, 0, 0)
+            return
+        cols = 3
+        for i, task in enumerate(self._tasks):
+            n = len(task["nodes"])
+            sub = f"{n} target{'' if n == 1 else 's'}"
+            card = TaskCard(i, task["name"], sub,
+                            self._select_task, self._task_open)
+            self._task_cards.append(card)
+            self.task_grid.addWidget(card, i // cols, i % cols)
+        if (self._selected_task is not None
+                and self._selected_task < len(self._task_cards)):
+            self._task_cards[self._selected_task].set_selected(True)
+
+    def _select_task(self, index: int) -> None:
+        self._selected_task = index
+        for i, c in enumerate(self._task_cards):
+            c.set_selected(i == index)
+
+    def _task_open(self, index: int) -> None:
+        self._selected_task = index
+        self._task_edit_selected()
+
+    def _task_create_new(self) -> None:
+        self._motion_new_task()
+        self._show_motion_editor()
+
+    def _task_edit_selected(self) -> None:
+        if self._selected_task is None:
+            return
+        self._editing_task = self._selected_task
+        task = self._tasks[self._selected_task]
+        self.task_name.setText(task["name"])
+        self._load_task_into_canvas(task)
+        self._show_motion_editor()
+
+    def _task_duplicate_selected(self) -> None:
+        if self._selected_task is None:
+            return
+        import copy
+        task = copy.deepcopy(self._tasks[self._selected_task])
+        task["name"] = task["name"] + " copy"
+        self._tasks.insert(self._selected_task + 1, task)
+        self._selected_task += 1
+        self._refresh_task_list()
+
+    def _task_delete_selected(self) -> None:
+        if self._selected_task is None:
+            return
+        del self._tasks[self._selected_task]
+        self._selected_task = None
+        self._refresh_task_list()
+
+    def _task_run_selected(self) -> None:
+        # Build-only: executing a Motion sequence on the robot is a deferred
+        # phase. Surface the intent without driving anything yet.
+        if self._selected_task is None:
+            return
+        name = self._tasks[self._selected_task]["name"]
+        self.statusBar().showMessage(
+            f"Run '{name}' — sequence execution is not implemented yet "
+            f"(build-only).", 4000)
 
     def _build_arrow_picker(self) -> QWidget:
         box = QGroupBox("Arrow")
@@ -1173,15 +1361,10 @@ class MainWindow(QMainWindow):
         self.joint_set_box.setVisible(not cartesian)
         self.cart_set_box.setVisible(cartesian)
         if cartesian:
-            self.axis_label.setText("X  → base X\nY  → base Y\nTwist → base Z")
             self.joystick.set_labels("X", "Y", "Z")
         else:
             base = 0 if self.jog_group == 0 else 3
             self.group_toggle_btn.setText("Joints 1–3" if self.jog_group == 0 else "Joints 4–6")
-            names = JOINT_NAMES
-            self.axis_label.setText(
-                f"X  → {names[base]}\nY  → {names[base+1]}\nTwist → {names[base+2]}"
-            )
             # Short labels on the joystick itself (J1..J6 = joint_1..joint_6).
             self.joystick.set_labels(
                 f"J{base+1}", f"J{base+2}", f"J{base+3}"
