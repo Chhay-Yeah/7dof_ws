@@ -17,7 +17,7 @@ import math
 
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QPainterPath
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor
 
 
 class Joystick(QWidget):
@@ -65,26 +65,37 @@ class Joystick(QWidget):
         ring_rect = QRectF(c.x() - r_ring, c.y() - r_ring, 2 * r_ring, 2 * r_ring)
         p.drawEllipse(ring_rect)
 
-        # circular arrow on the ring, rotated by current twist for feedback
+        # twist handle: two striped rectangular grips sitting on the ring at
+        # 3- and 9-o'clock, rotating with the current twist so it reads as a
+        # rotary "grab and turn" control (rectangle box with 90-deg stripes).
         p.save()
         p.translate(c)
-        p.rotate(self.twist * 60.0)  # visual feedback only
-        arrow_pen = QPen(QColor("#4f9bff"), max(2.0, ring_w * 0.5))
-        arrow_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(arrow_pen)
-        span = 250.0
+        p.rotate(self.twist * 60.0)
+        grip_col = QColor("#6aa9ff" if self._ring_active else "#4f9bff")
+        pad_long = ring_w * 2.6        # tangential length of the grip
+        pad_thick = ring_w * 1.6       # radial thickness
+        for sign in (1, -1):
+            p.save()
+            p.translate(sign * r_ring, 0.0)
+            pad = QRectF(-pad_thick / 2, -pad_long / 2, pad_thick, pad_long)
+            p.setPen(QPen(QColor("#23272d"), 1))
+            p.setBrush(QBrush(grip_col))
+            p.drawRoundedRect(pad, 3, 3)
+            # 90-degree stripes across the grip (knurl marks)
+            p.setPen(QPen(QColor("#e8f1ff"), 2))
+            for j in (-1, 0, 1):
+                y = j * pad_long * 0.26
+                p.drawLine(QPointF(-pad_thick * 0.32, y),
+                           QPointF(pad_thick * 0.32, y))
+            p.restore()
+        # short curved marks hint at the rotation direction
+        arc_pen = QPen(grip_col, max(2.0, ring_w * 0.35))
+        arc_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(arc_pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
         arc = QRectF(-r_ring, -r_ring, 2 * r_ring, 2 * r_ring)
-        p.drawArc(arc, int(20 * 16), int(span * 16))
-        # arrowhead at the end of the arc
-        end = math.radians(20 + span)
-        ex, ey = r_ring * math.cos(end), -r_ring * math.sin(end)
-        head = QPainterPath()
-        ah = ring_w * 0.9
-        head.moveTo(ex, ey)
-        head.lineTo(ex - ah, ey - ah * 0.4)
-        head.lineTo(ex - ah * 0.4, ey + ah)
-        head.closeSubpath()
-        p.fillPath(head, QBrush(QColor("#4f9bff")))
+        p.drawArc(arc, int(38 * 16), int(34 * 16))
+        p.drawArc(arc, int(218 * 16), int(34 * 16))
         p.restore()
 
         # base well
@@ -115,9 +126,9 @@ class Joystick(QWidget):
         lab(c.x(), c.y() + rl, "−" + self.y_label)
         lab(c.x() + rl, c.y(), "+" + self.x_label)
         lab(c.x() - rl, c.y(), "−" + self.x_label)
-        # twist label in the top-left corner (free space outside the ring)
+        # twist axis label in the top-left corner (free space outside the ring)
         p.drawText(QRectF(6, 4, self.width() - 12, 18),
-                   Qt.AlignmentFlag.AlignLeft, "↻ twist = " + self.twist_label)
+                   Qt.AlignmentFlag.AlignLeft, "↻ " + self.twist_label)
 
     # ── interaction ───────────────────────────────────────────────────────
     def _hit(self, pos):

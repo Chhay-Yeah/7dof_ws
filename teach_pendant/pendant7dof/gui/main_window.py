@@ -44,8 +44,8 @@ CART_STEP_PER_TICK = 0.0015   # m
 # Active modes (title, blurb). Order == sidebar order == mode_stack index.
 _MODES = [
     ("Jogging", "Joint & Cartesian jog"),
-    ("Drawing", "Draw on a canvas"),
     ("Motion", "Sequence targets"),
+    ("Drawing", "Draw on a canvas"),
     ("Status", "Live joint & EE readouts"),
     ("Settings", "Backend & options"),
 ]
@@ -172,16 +172,27 @@ JOG_AXIS_COLOR = "#ffa726"  # joystick axis label colour (orange)
 
 
 class EdgeItem(QGraphicsPathItem):
-    """A directed arrow between two nodes; re-routes via the nearest pair of
-    ports whenever either node moves. An arrow has a *kind*: "sequence" (advance
+    """A directed arrow between two nodes. Routed with **orthogonal** segments
+    only (horizontal/vertical, bending at right angles for diagonal pairs) and
+    anchored to a **fixed** pair of ports chosen at creation — the ports never
+    auto-switch as the nodes move. An arrow has a *kind*: "sequence" (advance
     immediately) or "timer" (wait ``delay`` seconds, shown as a circled "t")."""
 
     TIMER_COLOR = "#f0a020"
+    STUB = 22.0   # how far the arrow steps straight out of each port
 
-    def __init__(self, src: "NodeItem", dst: "NodeItem") -> None:
+    _NORMALS = {
+        "top": QPointF(0, -1), "bottom": QPointF(0, 1),
+        "left": QPointF(-1, 0), "right": QPointF(1, 0),
+    }
+
+    def __init__(self, src: "NodeItem", dst: "NodeItem",
+                 src_side: str = "right") -> None:
         super().__init__()
         self.src = src
         self.dst = dst
+        self.src_side = src_side if src_side in self._NORMALS else "right"
+        self.dst_side = self._pick_dst_side()   # fixed once, never auto-switches
         self.kind = "sequence"        # "sequence" | "timer"
         self.delay = 5.0              # seconds, used when kind == "timer"
         self.setZValue(-1)
@@ -202,21 +213,41 @@ class EdgeItem(QGraphicsPathItem):
         self.delay = float(secs)
         self.update()
 
-    def _ends(self):
-        best, bd = None, float("inf")
-        for s in ("top", "right", "bottom", "left"):
-            ps = self.src.port_scene(s)
-            for d in ("top", "right", "bottom", "left"):
-                pd = self.dst.port_scene(d)
-                dist = (ps.x() - pd.x()) ** 2 + (ps.y() - pd.y()) ** 2
-                if dist < bd:
-                    bd, best = dist, (ps, pd)
+    def _pick_dst_side(self) -> str:
+        """Choose the destination port once, as the dst port nearest the chosen
+        source port. Frozen afterwards so the arrow keeps pointing at one dot."""
+        a = self.src.port_scene(self.src_side)
+        best, bd = "left", float("inf")
+        for s in self._NORMALS:
+            d = (self.dst.port_scene(s) - a).manhattanLength()
+            if d < bd:
+                bd, best = d, s
         return best
 
+    def _waypoints(self):
+        """Orthogonal polyline src-port → … → dst-port. Steps straight out of
+        each port along its outward normal, then connects the stubs with at most
+        one right-angle bend so every segment is axis-aligned."""
+        a = self.src.port_scene(self.src_side)
+        b = self.dst.port_scene(self.dst_side)
+        na, nb = self._NORMALS[self.src_side], self._NORMALS[self.dst_side]
+        d = self.STUB
+        a1 = QPointF(a.x() + na.x() * d, a.y() + na.y() * d)
+        b1 = QPointF(b.x() + nb.x() * d, b.y() + nb.y() * d)
+        pts = [a, a1]
+        if abs(a1.x() - b1.x()) > 0.5 and abs(a1.y() - b1.y()) > 0.5:
+            if self.src_side in ("left", "right"):
+                pts.append(QPointF(b1.x(), a1.y()))   # horizontal then vertical
+            else:
+                pts.append(QPointF(a1.x(), b1.y()))   # vertical then horizontal
+        pts += [b1, b]
+        return pts
+
     def update_path(self) -> None:
-        a, b = self._ends()
-        path = QPainterPath(a)
-        path.lineTo(b)
+        pts = self._waypoints()
+        path = QPainterPath(pts[0])
+        for q in pts[1:]:
+            path.lineTo(q)
         self.setPath(path)
 
     def shape(self):
@@ -232,12 +263,14 @@ class EdgeItem(QGraphicsPathItem):
 
     def paint(self, p, opt, widget=None):
         import math
-        a, b = self._ends()
+        pts = self._waypoints()
+        prev, b = pts[-2], pts[-1]    # last segment defines the arrowhead angle
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         col = QColor("#4f9bff") if self.isSelected() else QColor("#cfd6e0")
         p.setPen(QPen(col, 3 if self.isSelected() else 2))
-        p.drawLine(a, b)
-        ang = math.atan2(b.y() - a.y(), b.x() - a.x())
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(self.path())
+        ang = math.atan2(b.y() - prev.y(), b.x() - prev.x())
         s = 11
         p1 = QPointF(b.x() - s * math.cos(ang - math.pi / 6),
                      b.y() - s * math.sin(ang - math.pi / 6))
@@ -246,10 +279,11 @@ class EdgeItem(QGraphicsPathItem):
         p.setBrush(QBrush(col))
         p.drawPolygon(QPolygonF([b, p1, p2]))
         if self.kind == "timer":
-            self._paint_timer_badge(p, a, b)
+            self._paint_timer_badge(p)
 
-    def _paint_timer_badge(self, p, a, b) -> None:
-        mid = QPointF((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
+    def _paint_timer_badge(self, p) -> None:
+        path = self.path()
+        mid = path.pointAtPercent(0.5)
         r = 11.0
         accent = QColor(self.TIMER_COLOR)
         # circled "t"
@@ -288,6 +322,7 @@ class NodeItem(QGraphicsItem):
     """A flowchart node (a saved target): a white box outlined in the canvas
     colour. Hovering reveals 4 mid-side ports you can drag to another node."""
     W, H, PORT_R, MARGIN = 124, 46, 5, 12
+    GRID = 8   # canvas snap grid (px)
 
     def __init__(self, name: str) -> None:
         super().__init__()
@@ -296,6 +331,7 @@ class NodeItem(QGraphicsItem):
         self._connecting = False
         self._temp = None
         self._start = None
+        self._start_side = None
         self.edges: list = []
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
@@ -351,6 +387,7 @@ class NodeItem(QGraphicsItem):
         side = self._port_at(e.pos())
         if side is not None:               # start an arrow from this port
             self._connecting = True
+            self._start_side = side
             self._start = self.port_scene(side)
             self._temp = QGraphicsLineItem()
             self._temp.setPen(QPen(QColor("#2a7fff"), 2, Qt.PenStyle.DashLine))
@@ -376,13 +413,17 @@ class NodeItem(QGraphicsItem):
             target = next((it for it in self.scene().items(e.scenePos())
                            if isinstance(it, NodeItem) and it is not self), None)
             if target is not None:
-                EdgeItem(self, target)
+                EdgeItem(self, target, src_side=self._start_side or "right")
             self.update()
             e.accept()
             return
         super().mouseReleaseEvent(e)
 
     def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            # Snap the box to the canvas grid as it moves.
+            g = self.GRID
+            return QPointF(round(value.x() / g) * g, round(value.y() / g) * g)
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             for ed in self.edges:
                 ed.update_path()
@@ -693,8 +734,8 @@ class MainWindow(QMainWindow):
         rcol.setContentsMargins(0, 0, 0, 0)
         rcol.setSpacing(0)
         self.mode_stack = QStackedWidget()
-        for builder in (self._build_jogging_tab, self._build_drawing_tab,
-                        self._build_motion_tab, self._build_status_tab,
+        for builder in (self._build_jogging_tab, self._build_motion_tab,
+                        self._build_drawing_tab, self._build_status_tab,
                         self._build_settings_tab):
             self.mode_stack.addWidget(builder())
         rcol.addWidget(self.mode_stack, 1)
@@ -897,6 +938,7 @@ class MainWindow(QMainWindow):
 
         self.jog_home_btn = QPushButton("Home", w)                # K3
         self.jog_home_btn.clicked.connect(lambda: self.node.goto_preset("Home"))
+        self.jog_home_btn.setStyleSheet(sel_qss)
         self.jog_home_btn.setGeometry(kx, 6 + 2 * S, 150, 42)
 
         speed = QWidget(w)                                        # K4
