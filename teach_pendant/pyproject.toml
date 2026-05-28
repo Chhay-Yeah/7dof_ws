@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61,<80", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "7dof-pendant"
+version = "0.1.0"
+description = "Teach pendant GUI for the 7-DOF robotic arm (ROS 2 Humble)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "7-DOF Arm Team" }]
+license = { text = "MIT" }
+dependencies = [
+    "PyQt6>=6.4",
+    # NOTE: rclpy and the ROS 2 message packages are NOT pip dependencies.
+    # They are provided by the system ROS 2 Humble install and activated by
+    # sourcing /opt/ros/humble/setup.bash. See pendant7dof/bootstrap.py.
+]
+
+[project.scripts]
+# Two aliases so either spelling launches the app.
+"7dof-pendant" = "pendant7dof.cli:main"
+"7dof_pendant" = "pendant7dof.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pendant7dof*"]
+
+[tool.setuptools.package-data]
+# Anything copied under pendant7dof/workspace by `7dof-pendant bundle`
+# ships inside the wheel.
+"pendant7dof" = ["workspace/**/*"]

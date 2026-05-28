@@ -1,0 +1,10 @@
+# Bundled workspace copy (created by `7dof-pendant bundle`) — large meshes,
+# regenerated on demand, never committed.
+pendant7dof/workspace/
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
