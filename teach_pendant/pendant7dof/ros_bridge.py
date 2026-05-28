@@ -16,7 +16,7 @@ from rclpy.node import Node
 from builtin_interfaces.msg import Duration
 from std_msgs.msg import String
 from sensor_msgs.msg import JointState
-from geometry_msgs.msg import PoseArray, PoseStamped, Point
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped, Point
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
@@ -79,6 +79,10 @@ class PendantBridge(Node):
         self._ee_pose: PoseStamped | None = None
         self._estopped = False
         self._last_drawing: str | None = None
+        # Internal Cartesian-jog target. Advances only while the robot keeps up;
+        # if it falls behind (workspace edge / unreachable) the target re-anchors
+        # to the actual pose so the joystick can't push it out of reach.
+        self._cart_target: list[float] | None = None
 
         # --- subscriptions ------------------------------------------------
         self.create_subscription(JointState, "/joint_states", self._cb_state, 20)
@@ -156,6 +160,17 @@ class PendantBridge(Node):
             f"JOG {JOINT_NAMES[idx]} {delta:+.2f} -> {q[idx]:+.3f} rad"
         )
 
+    def jog_joints(self, deltas: dict[int, float], duration_s: float = 0.18) -> None:
+        """Jog several joints at once in a single trajectory. Used by the
+        joystick, which streams small deltas at ~15 Hz; one trajectory per tick
+        keeps the joints moving together instead of fighting."""
+        if self._estopped or not deltas:
+            return
+        q = list(self._last_q)
+        for idx, d in deltas.items():
+            q[idx] = clamp_joint(idx, q[idx] + d)
+        self._send_traj(q, duration_s)
+
     def set_joint(self, idx: int, target_rad: float, duration_s: float = 1.5) -> None:
         if self._estopped:
             self.get_logger().warn("E-stop active — set ignored")
@@ -213,6 +228,59 @@ class PendantBridge(Node):
         self.target_pub.publish(target)
         self.get_logger().info(f"CART {axis}{delta:+.3f} m")
 
+    def _publish_ee_target(self, x: float, y: float, z: float) -> None:
+        target = PoseStamped()
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.header.frame_id = BASE_FRAME
+        p = Pose()
+        p.position.x, p.position.y, p.position.z = x, y, z
+        p.orientation = self._ee_pose.pose.orientation  # hold current orientation
+        target.pose = p
+        self.target_pub.publish(target)
+
+    # The commanded target may lead the actual EE by at most this much (m).
+    # The joystick integrates into an internal target, but it's clamped to
+    # stay within CART_LEAD_M of where the robot actually is. Since the actual
+    # pose is by definition reachable, the target can never be driven more than
+    # CART_LEAD_M outside the workspace — so the IK no longer saturates and the
+    # arm stops wobbling/twitching at the edges. The robot also can't be
+    # "outrun": once it stalls at an edge the target clamps and holds.
+    CART_LEAD_M = 0.01
+
+    def cartesian_jog_xyz(self, dx: float, dy: float, dz: float) -> None:
+        """Stream an EE target from the joystick (~15 Hz), integrating stick
+        deflection into an internal target that is lead-clamped to the actual
+        pose so it can't run past the reachable workspace."""
+        if self._estopped or self._ee_pose is None:
+            return
+        if dx == 0.0 and dy == 0.0 and dz == 0.0:
+            return
+        p = self._ee_pose.pose.position
+        cur = [p.x, p.y, p.z]
+        if self._cart_target is None:
+            self._cart_target = list(cur)
+        t = [self._cart_target[0] + dx,
+             self._cart_target[1] + dy,
+             self._cart_target[2] + dz]
+        lead = self.CART_LEAD_M
+        for i in range(3):
+            t[i] = min(cur[i] + lead, max(cur[i] - lead, t[i]))
+        self._cart_target = t
+        self._publish_ee_target(*t)
+
+    def set_cartesian(self, x: float, y: float, z: float) -> None:
+        """Send the EE to an absolute (x,y,z) in the base frame, holding the
+        current orientation. Backs the manual X/Y/Z set in Cartesian mode."""
+        if self._estopped:
+            self.get_logger().warn("E-stop active — set ignored")
+            return
+        if self._ee_pose is None:
+            self.get_logger().warn("no /ee_pose yet — is the FK node running?")
+            return
+        self._cart_target = [x, y, z]  # keep jog continuous from the set point
+        self._publish_ee_target(x, y, z)
+        self.get_logger().info(f"SET ee -> ({x:+.3f}, {y:+.3f}, {z:+.3f}) m")
+
     # ── drawing ───────────────────────────────────────────────────────────
     def send_drawing(self, strokes_dict: dict) -> None:
         if self._estopped:
@@ -241,6 +309,7 @@ class PendantBridge(Node):
 
     def estop(self) -> None:
         self._estopped = True
+        self._cart_target = None  # forget any in-flight jog target
         self.freeze()
         self.get_logger().error("E-STOP engaged — arm frozen, commands blocked")
 

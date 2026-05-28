@@ -1,7 +1,10 @@
 """Drawing canvas widget — captures pen strokes and tracks the live pen tip.
 
-Lifted from the project's drawing_ui_node CanvasView so the pendant's drawing
-tab behaves identically to the original standalone UI.
+The scene is sized in millimetres: one scene unit == 1 mm of robot workspace,
+and the scene rect equals the configured workspace (wx_mm x wy_mm). That keeps
+the canvas aspect ratio locked to the workspace aspect ratio, so a square drawn
+on screen is a square on the table, and the batch planner's px->mm scale is a
+clean 1:1 (it divides the reported canvas width/height back out).
 """
 
 from __future__ import annotations
@@ -12,17 +15,19 @@ from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPen, QPainterPath, QColor, QBrush
 
-# Canvas in pixels; the planner uses a 1:1 px->mm mapping.
-CANVAS_W = 60
-CANVAS_H = 60
+# Default workspace (mm). Matches the batch planner's default 40 mm box.
+DEFAULT_WORKSPACE_MM = 40.0
 
 
 class CanvasView(QGraphicsView):
-    def __init__(self) -> None:
+    def __init__(self, workspace_x_mm: float = DEFAULT_WORKSPACE_MM,
+                 workspace_y_mm: float = DEFAULT_WORKSPACE_MM) -> None:
         super().__init__()
-        self.scene_ = QGraphicsScene(0, 0, CANVAS_W, CANVAS_H)
+        self.wx = float(workspace_x_mm)
+        self.wy = float(workspace_y_mm)
+        self.scene_ = QGraphicsScene(0, 0, self.wx, self.wy)
         self.setScene(self.scene_)
-        self.setSceneRect(0, 0, CANVAS_W, CANVAS_H)
+        self.setSceneRect(0, 0, self.wx, self.wy)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setMinimumSize(300, 300)
@@ -35,9 +40,20 @@ class CanvasView(QGraphicsView):
         self._pen_last_pos: tuple[float, float] | None = None
         self._ensure_pen_dot()
 
+    # ── workspace size ────────────────────────────────────────────────────
+    def set_workspace(self, wx_mm: float, wy_mm: float) -> None:
+        """Resize the drawing area to a new workspace (mm). Clears strokes so
+        old pixel coordinates aren't reinterpreted at the new scale."""
+        self.wx = float(wx_mm)
+        self.wy = float(wy_mm)
+        self.scene_.setSceneRect(0, 0, self.wx, self.wy)
+        self.setSceneRect(0, 0, self.wx, self.wy)
+        self.clear()
+        self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+
     # ── live pen-tip dot ──────────────────────────────────────────────────
     def _ensure_pen_dot(self) -> None:
-        dot_r = max(0.4, CANVAS_W * 0.01)
+        dot_r = max(0.4, self.wx * 0.015)
         self.pen_dot = QGraphicsEllipseItem(-dot_r, -dot_r, 2 * dot_r, 2 * dot_r)
         self.pen_dot.setBrush(QBrush(QColor(135, 206, 235)))  # skyblue
         self.pen_dot.setPen(QPen(Qt.PenStyle.NoPen))
@@ -55,8 +71,8 @@ class CanvasView(QGraphicsView):
             if self.pen_dot is not None:
                 self.pen_dot.setVisible(False)
             return
-        x_px = norm_x * CANVAS_W
-        y_px = (1.0 - norm_y) * CANVAS_H
+        x_px = norm_x * self.wx
+        y_px = (1.0 - norm_y) * self.wy
         self._pen_last_pos = (x_px, y_px)
         self.pen_dot.setPos(x_px, y_px)
         self.pen_dot.setVisible(True)
@@ -109,7 +125,7 @@ class CanvasView(QGraphicsView):
 
     def get_drawing(self) -> dict:
         return {
-            "canvas": {"width": CANVAS_W, "height": CANVAS_H, "units": "px"},
+            "canvas": {"width": self.wx, "height": self.wy, "units": "mm"},
             "strokes": [
                 {"id": i, "points": s["points"]} for i, s in enumerate(self.strokes)
             ],

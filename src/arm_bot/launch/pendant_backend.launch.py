@@ -29,8 +29,11 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import (
+    LaunchConfiguration, PathJoinSubstitution, PythonExpression,
+)
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -38,21 +41,44 @@ def generate_launch_description():
     tip_link = LaunchConfiguration("tip_link")
     base_link = LaunchConfiguration("base_link")
     use_rviz = LaunchConfiguration("rviz")
-    use_gazebo = LaunchConfiguration("gazebo")
+    mode = LaunchConfiguration("mode")
 
     pkg = FindPackageShare("arm_bot")
+    moveit_pkg = FindPackageShare("arm_moveit_config")
 
-    # Gazebo (and the controller spawners that depend on its embedded
-    # controller_manager) are gated on `gazebo:=true`. With gazebo:=false the
-    # launch brings up only the IK/FK/drawing nodes — useful when attaching to
-    # a separately running sim or real hardware.
+    # Two runtime backends, selected by `mode`:
+    #   gazebo  — Gazebo + ros2_control spawners (the physics sim). Uses sim
+    #             time from /clock.
+    #   moveit  — arm_moveit_config demo.launch.py (MoveIt move_group + fake
+    #             ros2_control hardware + MoveIt RViz). No Gazebo, no /clock,
+    #             so wall time. Lighter; drawing/jog still work because the
+    #             fake controller exposes /arm_controller and /joint_states.
+    # The IK/FK/bridge/drawing nodes run in BOTH modes.
+    is_gazebo = PythonExpression(["'", mode, "' == 'gazebo'"])
+    is_moveit = PythonExpression(["'", mode, "' == 'moveit'"])
+    # use_sim_time must follow the clock source: True under Gazebo, False
+    # under the MoveIt demo (wall time). Stamping sim time on wall-time
+    # trajectories schedules them ~decades in the future and the robot never
+    # moves — the historical "robot stays still" bug.
+    sim_time = ParameterValue(is_gazebo, value_type=bool)
+
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([pkg, "launch", "gazebo.launch.py"])
         ),
         # Disable the EE/pen breadcrumb tracer — it tanks sim visual perf.
         launch_arguments={"enable_path_tracer": "false"}.items(),
-        condition=IfCondition(use_gazebo),
+        condition=IfCondition(is_gazebo),
+    )
+
+    # MoveIt demo backend (fake hardware + MoveIt RViz). Brings its own
+    # robot_state_publisher, controllers and RViz, so the Gazebo include,
+    # the controller spawners and the plain RViz are all disabled in this mode.
+    moveit_demo = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([moveit_pkg, "launch", "demo.launch.py"])
+        ),
+        condition=IfCondition(is_moveit),
     )
 
     jsb_spawner = Node(
@@ -60,37 +86,43 @@ def generate_launch_description():
         executable="spawner",
         arguments=["joint_state_broadcaster", "--controller-manager", "/controller_manager"],
         output="screen",
-        condition=IfCondition(use_gazebo),
+        condition=IfCondition(is_gazebo),
     )
     arm_spawner = Node(
         package="controller_manager",
         executable="spawner",
         arguments=["arm_controller", "--controller-manager", "/controller_manager"],
         output="screen",
-        condition=IfCondition(use_gazebo),
+        condition=IfCondition(is_gazebo),
     )
 
+    # Plain RViz only in gazebo mode (moveit mode gets MoveIt's own RViz) and
+    # only when rviz:=true.
     rviz = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([pkg, "launch", "rviz.launch.py"])
         ),
-        condition=IfCondition(use_rviz),
+        condition=IfCondition(PythonExpression(
+            ["'", mode, "' == 'gazebo' and '", use_rviz, "' == 'true'"]
+        )),
     )
 
     ik_node = Node(
         package="arm_bot", executable="ik_arm_v3.py", name="ik_7dof_v3",
         output="screen",
-        parameters=[{"base_link": base_link, "tip_link": tip_link}],
+        parameters=[{"base_link": base_link, "tip_link": tip_link,
+                     "use_sim_time": sim_time}],
     )
     fk_node = Node(
         package="arm_bot", executable="fk_arm_v3.py", name="fk_7dof_v3",
         output="screen",
-        parameters=[{"base_link": base_link, "tip_link": tip_link}],
+        parameters=[{"base_link": base_link, "tip_link": tip_link,
+                     "use_sim_time": sim_time}],
     )
     bridge = Node(
         package="arm_bot", executable="ik_to_trajectory.py",
         name="ik_to_trajectory", output="screen",
-        parameters=[{"step_horizon_s": 0.08}],
+        parameters=[{"step_horizon_s": 0.08, "use_sim_time": sim_time}],
     )
 
     # Batch drawing pipeline: /drawing/strokes -> offline spline + offline IK
@@ -101,7 +133,7 @@ def generate_launch_description():
         package="arm_bot", executable="drawing_batch_planner.py",
         name="drawing_batch_planner", output="screen",
         parameters=[{
-            "use_sim_time": True,
+            "use_sim_time": sim_time,
             "begin_draw_joints": [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0],
             "pen_offset_mm": 100.0,
             "pen_axis_local": [1.0, 0.0, 0.0],
@@ -109,7 +141,7 @@ def generate_launch_description():
             "dwell_seconds": 3.0,
             "workspace_x_mm": 40.0,
             "workspace_y_mm": 40.0,
-            "lift_mm": 10.0,
+            "lift_mm": 0.0,
             "log_joint_deltas": True,
             "locked_joints": [-1],
             "null_k": 2.0,
@@ -123,9 +155,16 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("base_link", default_value="base_link"),
         DeclareLaunchArgument("tip_link", default_value="ee"),
-        DeclareLaunchArgument("rviz", default_value="true"),
-        DeclareLaunchArgument("gazebo", default_value="true"),
+        DeclareLaunchArgument("rviz", default_value="true",
+                              description="Open plain RViz (gazebo mode only)."),
+        DeclareLaunchArgument(
+            "mode", default_value="gazebo",
+            choices=["gazebo", "moveit"],
+            description="Robot backend: 'gazebo' physics sim or 'moveit' "
+                        "demo (fake hardware + MoveIt RViz).",
+        ),
         gazebo,
+        moveit_demo,
         jsb_spawner,
         arm_spawner,
         rviz,

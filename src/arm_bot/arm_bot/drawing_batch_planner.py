@@ -133,7 +133,21 @@ class DrawingBatchPlanner(Node):
         # plane extents, not absolute base-frame coords.
         self.declare_parameter('workspace_x_mm',         100.0)
         self.declare_parameter('workspace_y_mm',         100.0)
-        self.declare_parameter('lift_mm',                -30.0)
+        # Pen-up clearance. POSITIVE lifts the pen UP, away from the paper;
+        # 0 = no lift (pen stays at paper height). NEGATIVE would drive the
+        # pen below the table — that target is unreachable in the drawing
+        # posture and makes the IK flip the wrist to reach for it (looks like
+        # the arm "glancing up" mid-stroke), so don't use negative values.
+        self.declare_parameter('lift_mm',                0.0)
+        # Shifts the paper plane up/down (base +Z) from the begin-draw pen-tip
+        # height. 0 = draw at the begin pose's natural height; positive lifts
+        # the whole plane, negative presses lower. The teach-pendant Drawing
+        # settings drive this per-drawing via the message `config` block.
+        self.declare_parameter('z_paper_offset_mm',      0.0)
+        # Safety clamp: the reachable centred drawing square. Larger boxes push
+        # joint_6 (tight limits) to its stops at the corners and IK degrades,
+        # so GUI-supplied workspace sizes are clamped to this.
+        self.declare_parameter('max_workspace_mm',       50.0)
 
         # ── Trajectory shaping ─────────────────────────────────────────────
         self.declare_parameter('sample_spacing_mm',      2.0)    # along stroke
@@ -212,6 +226,8 @@ class DrawingBatchPlanner(Node):
         self.t_dwell           = float(gp('dwell_seconds'))
         self.wx, self.wy       = gp('workspace_x_mm'), gp('workspace_y_mm')
         self.lift_mm           = float(gp('lift_mm'))
+        self.z_paper_offset_mm = float(gp('z_paper_offset_mm'))
+        self.max_workspace_mm  = float(gp('max_workspace_mm'))
         self.ds_mm             = float(gp('sample_spacing_mm'))
         self.v_draw            = float(gp('draw_speed_mm_s'))
         self.v_travel          = float(gp('travel_speed_mm_s'))
@@ -372,6 +388,22 @@ class DrawingBatchPlanner(Node):
             self.get_logger().error(f'Bad JSON: {e}')
             return
 
+        # Per-drawing config from the teach pendant. The GUI is the single
+        # source of truth so the canvas and the robot workspace stay in sync:
+        # the same workspace_x/y the GUI sized the canvas to is what we map
+        # into here, so a square drawn on screen is square on the table.
+        cfg = data.get('config', {})
+        if 'workspace_x_mm' in cfg:
+            self.wx = min(float(cfg['workspace_x_mm']), self.max_workspace_mm)
+        if 'workspace_y_mm' in cfg:
+            self.wy = min(float(cfg['workspace_y_mm']), self.max_workspace_mm)
+        if 'lift_mm' in cfg:
+            # Negative lift/offset drives the pen below the table — unreachable
+            # in the drawing posture and makes the IK flip the wrist mid-stroke.
+            self.lift_mm = max(0.0, float(cfg['lift_mm']))
+        if 'z_paper_offset_mm' in cfg:
+            self.z_paper_offset_mm = max(0.0, float(cfg['z_paper_offset_mm']))
+
         strokes = data.get('strokes', [])
         if not strokes or all(not s.get('points') for s in strokes):
             self.get_logger().warn('Empty drawing — nothing to plan')
@@ -431,8 +463,8 @@ class DrawingBatchPlanner(Node):
         # = identity → paper +Z = base +Z = away from horizontal paper.
         self.ox      = -self.wx / 2.0
         self.oy      = -self.wy / 2.0
-        self.z_paper = 0.0
-        self.z_lift  = self.lift_mm
+        self.z_paper = self.z_paper_offset_mm
+        self.z_lift  = self.z_paper_offset_mm + self.lift_mm
         # Orientation stays = R_begin throughout. q_draw/q_approach are
         # kept identical so the SLERP in the approach/lift loops is a
         # no-op (orientation already correct from the joint-space move

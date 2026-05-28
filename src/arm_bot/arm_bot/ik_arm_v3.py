@@ -44,6 +44,32 @@ class IKNode(Node):
         self._base = self.get_parameter("base_link").value
         self._tip  = self.get_parameter("tip_link").value
 
+        # Null-space (redundancy) resolution is tunable so a drawing-specific
+        # instance can pull the elbow toward the draw posture instead of the
+        # joint-limit midpoint. Pulling toward q_mid is wrong for drawing:
+        # the draw posture sits far from mid, so NULL_K*(q_mid - q) is large,
+        # dominates the per-tick dq budget after the DQ_MAX clamp, and starves
+        # task tracking (~15 mm following error). Pull toward the draw posture
+        # (null_target = begin_draw_joints) to zero that term out.
+        # Defaults reproduce the original jog behaviour (q_mid, NULL_K=0.3).
+        self.declare_parameter("null_k", self.NULL_K)
+        self.declare_parameter("inner_iters", self.INNER_ITERS)
+        # Empty list (the ROS-friendly sentinel) => fall back to q_mid.
+        self.declare_parameter("null_target", [0.0])
+        # Per-joint weighted-DLS weights. High weight = that joint moves less.
+        # For drawing, penalise the tight-limit wrist joints (joint_6, joint_7)
+        # so the tracker doesn't drift them into their limits and pin (which
+        # leaves a position residual). Sentinel [0.0] => uniform (jog default).
+        self.declare_parameter("joint_weights", [0.0])
+        self._null_k = float(self.get_parameter("null_k").value)
+        self._inner_iters = int(self.get_parameter("inner_iters").value)
+        nt = list(self.get_parameter("null_target").value)
+        self._null_target = (np.array(nt, dtype=float)
+                             if len(nt) > 1 else None)
+        jw = list(self.get_parameter("joint_weights").value)
+        self._joint_weights = (np.array(jw, dtype=float)
+                               if len(jw) > 1 else None)
+
         self._chain: UrdfChain | None = None
         self._joint_index = None
 
@@ -78,6 +104,25 @@ class IKNode(Node):
         self.get_logger().info(
             f"URDF loaded: {self._chain.n} DoF — joints: {self._chain.joint_names}"
         )
+        if (self._null_target is not None and
+                self._null_target.shape[0] != self._chain.n):
+            self.get_logger().warn(
+                f"null_target has {self._null_target.shape[0]} entries but "
+                f"chain has {self._chain.n} DoF — ignoring, using q_mid")
+            self._null_target = None
+        if (self._joint_weights is not None and
+                self._joint_weights.shape[0] != self._chain.n):
+            self.get_logger().warn(
+                f"joint_weights has {self._joint_weights.shape[0]} entries but "
+                f"chain has {self._chain.n} DoF — ignoring (uniform)")
+            self._joint_weights = None
+        self._W_inv = (np.diag(1.0 / self._joint_weights)
+                       if self._joint_weights is not None else np.eye(self._chain.n))
+        tgt = "begin/custom" if self._null_target is not None else "q_mid"
+        self.get_logger().info(
+            f"null-space: target={tgt}, NULL_K={self._null_k}, "
+            f"inner_iters={self._inner_iters}, "
+            f"joint_weights={'set' if self._joint_weights is not None else 'uniform'}")
 
     def _cb_joints(self, msg: JointState):
         if self._chain is None:
@@ -111,7 +156,10 @@ class IKNode(Node):
         I6 = np.eye(6)
         In = np.eye(n)
 
-        for _ in range(self.INNER_ITERS):
+        q_null = (self._null_target if self._null_target is not None
+                  else self._chain.q_mid)
+
+        for _ in range(self._inner_iters):
             J, T_cur = self._chain.jacobian(self._q)
             p_ee = T_cur[:3, 3]
 
@@ -127,11 +175,13 @@ class IKNode(Node):
             lam = self.LAMBDA_MIN + (self.LAMBDA_MAX - self.LAMBDA_MIN) * \
                   min(1.0, err_norm / self.LAMBDA_KNEE)
 
-            M  = J @ J.T + (lam ** 2) * I6
-            dq = J.T @ np.linalg.solve(M, np.r_[e_p, e_r])
+            # Weighted damped least-squares: high-weight joints move less.
+            W_inv = self._W_inv
+            M  = J @ W_inv @ J.T + (lam ** 2) * I6
+            dq = W_inv @ J.T @ np.linalg.solve(M, np.r_[e_p, e_r])
 
-            Jp  = J.T @ np.linalg.solve(M, J)
-            dq += (In - Jp) @ (self.NULL_K * (self._chain.q_mid - self._q))
+            Jp  = W_inv @ J.T @ np.linalg.solve(M, J)
+            dq += (In - Jp) @ (self._null_k * (q_null - self._q))
 
             mag = np.linalg.norm(dq)
             if mag > self.DQ_MAX:
