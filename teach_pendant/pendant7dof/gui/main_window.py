@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QDial, QStyle,
     QGraphicsOpacityEffect,
 )
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize
-from PyQt6.QtGui import QDoubleValidator, QPixmap, QPainter, QIcon, QColor
+from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QEvent, QRect
+from PyQt6.QtGui import QDoubleValidator, QPixmap, QPainter, QIcon, QColor, QPen
 
 from .. import bootstrap
 from ..ros_bridge import PendantBridge, JOINT_NAMES
@@ -111,6 +111,49 @@ class ModeCard(QFrame):
         if self._enabled and self.rect().contains(e.pos()):
             self._on_click()
         super().mouseReleaseEvent(e)
+
+
+class GridOverlay(QWidget):
+    """A faint, labelled reference grid drawn on top of its parent — a layout
+    aid so cells can be named (A1, B2, …) when describing arrangement. It's
+    mouse-transparent, so it never blocks the controls underneath. Cell size is
+    fixed in pixels; labels are the spreadsheet-style column letter + row number.
+    """
+
+    def __init__(self, parent: QWidget, step: int = 80) -> None:
+        super().__init__(parent)
+        self.step = step
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        parent.installEventFilter(self)
+        self.setGeometry(parent.rect())
+        self.raise_()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            self.setGeometry(QRect(0, 0, obj.width(), obj.height()))
+            self.raise_()
+        return False
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        s = self.step
+        p.setPen(QPen(QColor(170, 170, 170, 70), 1))
+        cols = w // s + 1
+        rows = h // s + 1
+        for c in range(cols + 1):
+            p.drawLine(c * s, 0, c * s, h)
+        for r in range(rows + 1):
+            p.drawLine(0, r * s, w, r * s)
+        f = p.font()
+        f.setPointSize(8)
+        p.setFont(f)
+        p.setPen(QColor(210, 210, 210, 150))
+        for c in range(cols):
+            if c >= 26:
+                break
+            for r in range(rows):
+                p.drawText(c * s + 3, r * s + 12, f"{chr(ord('A') + c)}{r + 1}")
 
 
 class MainWindow(QMainWindow):
@@ -390,82 +433,90 @@ class MainWindow(QMainWindow):
 
     # ── jogging page (joint + cartesian behind the joystick) ──────────────
     def _build_jogging_tab(self) -> QWidget:
+        # Absolute placement aligned to the 80 px grid overlay so positions can
+        # be dictated by cell (A1, C5, K1, …). Column letter -> index*80,
+        # row number -> (n-1)*80.
+        S = 80
         w = QWidget()
-        outer = QVBoxLayout(w)
 
-        main = QHBoxLayout()
-
-        # Left: live joint info, one joint per row.
-        info_col = QVBoxLayout()
+        # Live joint info, top-left starting at A1, one joint per row.
+        info = QWidget(w)
+        iv = QVBoxLayout(info)
+        iv.setContentsMargins(4, 2, 4, 2)
+        iv.setSpacing(2)
         head = QLabel("Joints")
         head.setStyleSheet("font-weight: bold;")
-        info_col.addWidget(head)
+        iv.addWidget(head)
         self.joint_info_labels: list[QLabel] = []
         for name in JOINT_NAMES:
             lbl = QLabel(f"{name} = +0.000")
             lbl.setStyleSheet("font-family: monospace; font-size: 13px;")
             self.joint_info_labels.append(lbl)
-            info_col.addWidget(lbl)
-        info_col.addSpacing(6)
+            iv.addWidget(lbl)
         self.ee_info_label = QLabel("ee = —")
-        self.ee_info_label.setStyleSheet("font-family: monospace; font-size: 12px; color: #aaa;")
-        info_col.addWidget(self.ee_info_label)
-        info_col.addStretch(1)
-        main.addLayout(info_col)
-        main.addSpacing(16)
+        self.ee_info_label.setStyleSheet("font-family: monospace; font-size: 11px; color: #aaa;")
+        iv.addWidget(self.ee_info_label)
+        iv.addStretch(1)
+        info.setGeometry(4, 4, 168, 250)
 
-        # Centre-left: joystick (fixed, top-aligned).
+        # Joystick centred in C6 → (200, 440).
         self.joystick = Joystick(on_jog=self._on_joy)
+        self.joystick.setParent(w)
         self.joystick.setFixedSize(240, 240)
-        main.addWidget(self.joystick, 0, Qt.AlignmentFlag.AlignTop)
-        main.addSpacing(18)
+        self.joystick.move(200 - 120, 440 - 120)   # (80, 320)
 
-        # Right: pressable boxes stacked vertically + the joint-7 dial.
-        ctrl = QVBoxLayout()
-        self.mode_toggle_btn = QPushButton("Mode: Joint")
-        self.mode_toggle_btn.clicked.connect(self._toggle_jog_mode)
-        self.group_toggle_btn = QPushButton("Joints 1–3")
-        self.group_toggle_btn.clicked.connect(self._toggle_jog_group)
-        ctrl.addWidget(self.mode_toggle_btn)
-        ctrl.addWidget(self.group_toggle_btn)
-
-        spd = QHBoxLayout()
-        spd.addWidget(QLabel("Speed:"))
-        self.jog_speed = QDoubleSpinBox()
-        self.jog_speed.setRange(0.2, 3.0)
-        self.jog_speed.setSingleStep(0.1)
-        self.jog_speed.setValue(1.0)
-        spd.addWidget(self.jog_speed)
-        spd.addStretch(1)
-        ctrl.addLayout(spd)
-
-        self.axis_label = QLabel()
-        self.axis_label.setStyleSheet("font-family: monospace; font-size: 13px;")
-        ctrl.addWidget(self.axis_label)
-
-        self.joint7_box = QGroupBox("Joint 7 (tool roll)")
+        # Joint 7 dial centred in J6 → (760, 440).
+        self.joint7_box = QGroupBox("Joint 7", w)
         v7 = QVBoxLayout(self.joint7_box)
+        v7.setContentsMargins(6, 4, 6, 4)
         self.dial7 = QDial()
         self.dial7.setRange(-160, 160)   # 0.01 rad per step over [-1.6, 1.6]
         self.dial7.setNotchesVisible(True)
         self.dial7.setWrapping(False)
-        self.dial7.setFixedSize(110, 110)
+        self.dial7.setFixedSize(94, 94)
         self.dial7.valueChanged.connect(self._on_dial7)
         v7.addWidget(self.dial7, alignment=Qt.AlignmentFlag.AlignCenter)
         self.dial7_value_label = QLabel("+0.000 rad")
         self.dial7_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.dial7_value_label.setStyleSheet("font-family: monospace;")
         v7.addWidget(self.dial7_value_label)
-        ctrl.addWidget(self.joint7_box)
-        ctrl.addStretch(1)
-        main.addLayout(ctrl)
+        self.joint7_box.setFixedSize(126, 156)
+        self.joint7_box.move(760 - 63, 440 - 78)    # (697, 362)
 
-        main.addStretch(1)   # keep the cluster shifted left
-        outer.addLayout(main, 1)
+        # Control cluster anchored with the Mode selector at K1 (x = 800),
+        # then Joint selector (K2), Speed (K3), axis legend (K4).
+        kx = 10 * S
+        sel_qss = (
+            "QPushButton { border: 2px solid #6a7280; border-radius: 8px;"
+            " background: #3a3f47; color: white; }"
+            " QPushButton:hover { background: #454b54; }"
+        )
+        self.mode_toggle_btn = QPushButton("Mode: Joint", w)
+        self.mode_toggle_btn.clicked.connect(self._toggle_jog_mode)
+        self.mode_toggle_btn.setStyleSheet(sel_qss)
+        self.mode_toggle_btn.setGeometry(kx, 6, 150, 42)          # K1
+        self.group_toggle_btn = QPushButton("Joints 1–3", w)
+        self.group_toggle_btn.clicked.connect(self._toggle_jog_group)
+        self.group_toggle_btn.setStyleSheet(sel_qss)
+        self.group_toggle_btn.setGeometry(kx, 6 + S, 150, 42)     # K2
 
-        # Compact set-joint row (~30 px), joint mode only.
-        self.joint_set_box = QWidget()
-        self.joint_set_box.setMaximumHeight(36)
+        speed = QWidget(w)
+        sl = QHBoxLayout(speed)
+        sl.setContentsMargins(0, 0, 0, 0)
+        sl.addWidget(QLabel("Speed:"))
+        self.jog_speed = QDoubleSpinBox()
+        self.jog_speed.setRange(0.2, 3.0)
+        self.jog_speed.setSingleStep(0.1)
+        self.jog_speed.setValue(1.0)
+        sl.addWidget(self.jog_speed)
+        speed.setGeometry(kx, 6 + 2 * S, 150, 32)                 # K3
+
+        self.axis_label = QLabel(w)
+        self.axis_label.setStyleSheet("font-family: monospace; font-size: 13px;")
+        self.axis_label.setGeometry(kx, 6 + 3 * S, 150, 90)       # K4
+
+        # Compact set-joint row at D1 (x = 240); joint mode only.
+        self.joint_set_box = QWidget(w)
         self.joint_set_box.setStyleSheet(
             "QPushButton, QComboBox, QLineEdit { min-height: 0px; max-height: 30px; padding: 2px 8px; }"
         )
@@ -483,12 +534,16 @@ class MainWindow(QMainWindow):
         jbtn = QPushButton("Set")
         jbtn.clicked.connect(self._do_set_joint)
         jset.addWidget(jbtn)
-        jset.addStretch(1)
-        outer.addWidget(self.joint_set_box)
+        self.joint_set_box.setGeometry(3 * S, 6, 380, 34)
 
-        # Manual X/Y/Z set (cartesian mode only).
-        self.cart_set_box = QGroupBox("Set position X / Y / Z (m)")
+        # Manual X/Y/Z set, same slot (D1), cartesian mode only.
+        self.cart_set_box = QWidget(w)
+        self.cart_set_box.setStyleSheet(
+            "QPushButton, QLineEdit { min-height: 0px; max-height: 30px; padding: 2px 8px; }"
+        )
         cset = QHBoxLayout(self.cart_set_box)
+        cset.setContentsMargins(0, 0, 0, 0)
+        cset.addWidget(QLabel("Set XYZ (m):"))
         self.xyz_inputs: list[QLineEdit] = []
         for axis in ("x", "y", "z"):
             cset.addWidget(QLabel(axis.upper()))
@@ -500,9 +555,11 @@ class MainWindow(QMainWindow):
         cbtn = QPushButton("Set")
         cbtn.clicked.connect(self._do_set_cartesian)
         cset.addWidget(cbtn)
-        outer.addWidget(self.cart_set_box)
+        self.cart_set_box.setGeometry(3 * S, 6, 470, 34)
 
         self._update_jog_ui()
+        # Temporary layout aid: faint labelled grid over everything on this page.
+        self.jog_grid = GridOverlay(w)
         return w
 
     def _toggle_jog_mode(self) -> None:
