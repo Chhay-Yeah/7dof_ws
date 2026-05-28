@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QDial, QStyle, QCheckBox,
     QListWidget, QListWidgetItem, QScrollArea, QGraphicsOpacityEffect,
     QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsPathItem,
-    QGraphicsLineItem,
+    QGraphicsLineItem, QRadioButton,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QEvent, QRect, QRectF,
@@ -25,7 +25,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QDoubleValidator, QPixmap, QPainter, QIcon, QColor, QPen, QBrush, QDrag,
-    QPainterPath, QPolygonF,
+    QPainterPath, QPolygonF, QPainterPathStroker, QFontMetricsF,
 )
 
 from .. import bootstrap
@@ -213,17 +213,34 @@ CANVAS_BG = "#1f2227"
 
 class EdgeItem(QGraphicsPathItem):
     """A directed arrow between two nodes; re-routes via the nearest pair of
-    ports whenever either node moves."""
+    ports whenever either node moves. An arrow has a *kind*: "sequence" (advance
+    immediately) or "timer" (wait ``delay`` seconds, shown as a circled "t")."""
+
+    TIMER_COLOR = "#f0a020"
 
     def __init__(self, src: "NodeItem", dst: "NodeItem") -> None:
         super().__init__()
         self.src = src
         self.dst = dst
+        self.kind = "sequence"        # "sequence" | "timer"
+        self.delay = 5.0              # seconds, used when kind == "timer"
         self.setZValue(-1)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
         src.scene().addItem(self)
         src.add_edge(self)
         dst.add_edge(self)
         self.update_path()
+
+    def set_kind(self, kind: str) -> None:
+        if kind not in ("sequence", "timer"):
+            return
+        self.kind = kind
+        self.prepareGeometryChange()
+        self.update()
+
+    def set_delay(self, secs: float) -> None:
+        self.delay = float(secs)
+        self.update()
 
     def _ends(self):
         best, bd = None, float("inf")
@@ -242,14 +259,23 @@ class EdgeItem(QGraphicsPathItem):
         path.lineTo(b)
         self.setPath(path)
 
+    def shape(self):
+        stroker = QPainterPathStroker()
+        stroker.setWidth(14)          # fat clickable band around the thin line
+        return stroker.createStroke(self.path())
+
     def boundingRect(self):
-        return self.path().boundingRect().adjusted(-14, -14, 14, 14)
+        r = self.path().boundingRect().adjusted(-14, -14, 14, 14)
+        if self.kind == "timer":
+            r = r.adjusted(-60, -24, 60, 24)   # room for the midpoint badge
+        return r
 
     def paint(self, p, opt, widget=None):
         import math
         a, b = self._ends()
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(QPen(QColor("#cfd6e0"), 2))
+        col = QColor("#4f9bff") if self.isSelected() else QColor("#cfd6e0")
+        p.setPen(QPen(col, 3 if self.isSelected() else 2))
         p.drawLine(a, b)
         ang = math.atan2(b.y() - a.y(), b.x() - a.x())
         s = 11
@@ -257,8 +283,45 @@ class EdgeItem(QGraphicsPathItem):
                      b.y() - s * math.sin(ang - math.pi / 6))
         p2 = QPointF(b.x() - s * math.cos(ang + math.pi / 6),
                      b.y() - s * math.sin(ang + math.pi / 6))
-        p.setBrush(QBrush(QColor("#cfd6e0")))
+        p.setBrush(QBrush(col))
         p.drawPolygon(QPolygonF([b, p1, p2]))
+        if self.kind == "timer":
+            self._paint_timer_badge(p, a, b)
+
+    def _paint_timer_badge(self, p, a, b) -> None:
+        mid = QPointF((a.x() + b.x()) / 2.0, (a.y() + b.y()) / 2.0)
+        r = 11.0
+        accent = QColor(self.TIMER_COLOR)
+        # circled "t"
+        p.setBrush(QBrush(QColor("white")))
+        p.setPen(QPen(accent, 2))
+        p.drawEllipse(mid, r, r)
+        f = p.font()
+        f.setBold(True)
+        f.setPointSize(9)
+        p.setFont(f)
+        p.setPen(accent)
+        p.drawText(QRectF(mid.x() - r, mid.y() - r, 2 * r, 2 * r),
+                   Qt.AlignmentFlag.AlignCenter, "t")
+        # "= Ns" pill to the right of the circle
+        label = f"= {self.delay:g}s"
+        fm = QFontMetricsF(f)
+        tw = fm.horizontalAdvance(label) + 12
+        th = fm.height() + 2
+        pill = QRectF(mid.x() + r + 3, mid.y() - th / 2, tw, th)
+        p.setBrush(QBrush(QColor("white")))
+        p.setPen(QPen(accent, 1))
+        p.drawRoundedRect(pill, 5, 5)
+        p.setPen(QColor("#1b1b1b"))
+        p.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
+
+    def mouseDoubleClickEvent(self, e):
+        cb = getattr(self.scene(), "edge_double_clicked", None)
+        if callable(cb):
+            cb(self)
+            e.accept()
+            return
+        super().mouseDoubleClickEvent(e)
 
 
 class NodeItem(QGraphicsItem):
@@ -376,6 +439,8 @@ class MotionCanvas(QGraphicsView):
         self.scene_ = QGraphicsScene(self)
         self.scene_.setSceneRect(-2000, -2000, 4000, 4000)
         self.setScene(self.scene_)
+        # Set by MainWindow; EdgeItem calls it on double-click.
+        self.scene_.edge_double_clicked = None
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setAcceptDrops(True)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -985,11 +1050,11 @@ class MainWindow(QMainWindow):
         top.addStretch(1)
         left.addLayout(top)
         self.motion_canvas = MotionCanvas()
+        self.motion_canvas.scene_.edge_double_clicked = self._on_motion_edge_double
         left.addWidget(self.motion_canvas, 1)
         main.addLayout(left, 1)
 
         palette_box = QGroupBox("Targets")
-        palette_box.setFixedWidth(220)
         pv = QVBoxLayout(palette_box)
         hint = QLabel("Drag a target onto the canvas.")
         hint.setStyleSheet("color: #999; font-size: 11px;")
@@ -1003,11 +1068,78 @@ class MainWindow(QMainWindow):
         self.motion_palette_layout.addStretch(1)
         area.setWidget(inner)
         pv.addWidget(area, 1)
-        main.addWidget(palette_box)
+
+        self.motion_side = QStackedWidget()
+        self.motion_side.setFixedWidth(220)
+        self.motion_side.addWidget(palette_box)                 # page 0: targets
+        self.motion_side.addWidget(self._build_arrow_picker())  # page 1: arrow type
+        main.addWidget(self.motion_side)
         return w
 
     def _motion_new_task(self) -> None:
         self.motion_canvas.scene_.clear()
+        self._motion_edge = None
+        if hasattr(self, "motion_side"):
+            self.motion_side.setCurrentIndex(0)
+
+    def _build_arrow_picker(self) -> QWidget:
+        box = QGroupBox("Arrow")
+        v = QVBoxLayout(box)
+        hint = QLabel("Choose how this arrow advances to the next target.")
+        hint.setStyleSheet("color: #999; font-size: 11px;")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        self._arrow_seq_radio = QRadioButton("Sequence — go immediately")
+        self._arrow_timer_radio = QRadioButton("Timer — wait, then go")
+        grp = QButtonGroup(box)
+        grp.addButton(self._arrow_seq_radio)
+        grp.addButton(self._arrow_timer_radio)
+        self._arrow_seq_radio.setChecked(True)
+        self._arrow_seq_radio.toggled.connect(self._on_arrow_kind_changed)
+        v.addWidget(self._arrow_seq_radio)
+        v.addWidget(self._arrow_timer_radio)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Wait:"))
+        self._arrow_delay_spin = QDoubleSpinBox()
+        self._arrow_delay_spin.setRange(0.1, 600.0)
+        self._arrow_delay_spin.setSingleStep(0.5)
+        self._arrow_delay_spin.setDecimals(1)
+        self._arrow_delay_spin.setSuffix(" s")
+        self._arrow_delay_spin.setValue(5.0)
+        self._arrow_delay_spin.setEnabled(False)
+        self._arrow_delay_spin.valueChanged.connect(self._on_arrow_delay_changed)
+        row.addWidget(self._arrow_delay_spin, 1)
+        v.addLayout(row)
+
+        v.addStretch(1)
+        done = QPushButton("Done")
+        done.clicked.connect(lambda: self.motion_side.setCurrentIndex(0))
+        v.addWidget(done)
+        return box
+
+    def _on_motion_edge_double(self, edge) -> None:
+        self._motion_edge = edge
+        self._arrow_delay_spin.setValue(edge.delay)
+        if edge.kind == "timer":
+            self._arrow_timer_radio.setChecked(True)
+        else:
+            self._arrow_seq_radio.setChecked(True)
+        self._arrow_delay_spin.setEnabled(edge.kind == "timer")
+        self.motion_side.setCurrentIndex(1)
+
+    def _on_arrow_kind_changed(self, _checked: bool = False) -> None:
+        kind = "timer" if self._arrow_timer_radio.isChecked() else "sequence"
+        self._arrow_delay_spin.setEnabled(kind == "timer")
+        edge = getattr(self, "_motion_edge", None)
+        if edge is not None:
+            edge.set_kind(kind)
+
+    def _on_arrow_delay_changed(self, val: float) -> None:
+        edge = getattr(self, "_motion_edge", None)
+        if edge is not None:
+            edge.set_delay(val)
 
     def _refresh_motion_palette(self) -> None:
         lay = self.motion_palette_layout
