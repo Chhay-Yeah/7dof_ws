@@ -41,15 +41,28 @@ launch.
 7dof-pendant launch --no-backend   # attach to an already-running backend
 7dof-pendant build           # colcon-build the workspace and exit
 7dof-pendant bundle          # copy the dev workspace source into the package
+7dof-pendant release         # build a shippable self-contained wheel
 7dof-pendant doctor          # print environment diagnostics
 ```
 
 ## Building a self-contained wheel
 
 By default the package finds your `~/7dof_ws` at runtime (no 49 MB of meshes
-duplicated into git). To ship a wheel that carries the workspace inside it:
+duplicated into git). To ship a wheel that carries the workspace inside it, run:
 
 ```bash
-7dof-pendant bundle          # copies ../src into pendant7dof/workspace
-python -m build              # produces a self-contained wheel
+7dof-pendant release         # bundle + build + clean up, in one step
 ```
+
+This bundles the backend source, builds the wheel **without pip build
+isolation** (so it uses your vetted `setuptools>=61`, not an arbitrary cached
+one), then removes the bundle so your dev launches keep using the live
+`~/7dof_ws`. The wheel lands in `dist/7dof_pendant-<version>-py3-none-any.whl`.
+
+> Do **not** use `python -m build` here: pip's build isolation can pull an
+> ancient `setuptools` that ignores the PEP 621 `[project]` table and silently
+> produces a broken `UNKNOWN-0.0.0` wheel. `7dof-pendant release` avoids that
+> trap (and checks your `setuptools`/`wheel` versions first).
+
+Flags: `--no-bundle` builds a GUI-only wheel (bring your own backend);
+`--keep-bundle` leaves the bundled workspace in place after building.
