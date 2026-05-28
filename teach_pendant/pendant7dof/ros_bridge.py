@@ -199,6 +199,20 @@ class PendantBridge(Node):
     def send_home(self) -> None:
         self.goto_preset("Home")
 
+    def move_to_joints(self, positions, duration_s: float = 2.0) -> None:
+        """Move to an arbitrary 7-joint configuration (used to recall a saved
+        target)."""
+        if self._estopped:
+            self.get_logger().warn("E-stop active — move ignored")
+            return
+        if positions is None or len(positions) != 7:
+            self.get_logger().warn("move_to_joints needs 7 positions")
+            return
+        self._clear_path()
+        q = [clamp_joint(i, float(positions[i])) for i in range(7)]
+        self._send_traj(q, duration_s)
+        self.get_logger().info("MOVE to saved target")
+
     def cartesian_jog(self, axis: str, delta: float) -> None:
         """Nudge the end-effector target along a base-frame axis.
 

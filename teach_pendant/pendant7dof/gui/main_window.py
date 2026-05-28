@@ -14,11 +14,19 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget, QButtonGroup, QVBoxLayout,
     QHBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox, QLineEdit,
-    QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QDial, QStyle,
-    QGraphicsOpacityEffect,
+    QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QDial, QStyle, QCheckBox,
+    QListWidget, QListWidgetItem, QScrollArea, QGraphicsOpacityEffect,
+    QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsPathItem,
+    QGraphicsLineItem,
 )
-from PyQt6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QEvent, QRect
-from PyQt6.QtGui import QDoubleValidator, QPixmap, QPainter, QIcon, QColor, QPen
+from PyQt6.QtCore import (
+    Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QEvent, QRect, QRectF,
+    QPointF, QMimeData,
+)
+from PyQt6.QtGui import (
+    QDoubleValidator, QPixmap, QPainter, QIcon, QColor, QPen, QBrush, QDrag,
+    QPainterPath, QPolygonF,
+)
 
 from .. import bootstrap
 from ..ros_bridge import PendantBridge, JOINT_NAMES
@@ -37,12 +45,12 @@ CART_STEP_PER_TICK = 0.0015   # m
 _MODES = [
     ("Jogging", "Joint & Cartesian jog"),
     ("Drawing", "Draw on a canvas"),
+    ("Motion", "Sequence targets"),
     ("Status", "Live joint & EE readouts"),
     ("Settings", "Backend & options"),
 ]
 _COMING_SOON = [
     ("Teach", "Record waypoints"),
-    ("Programs", "Run saved sequences"),
     ("Calibration", "Tool & base setup"),
     ("Vision", "Camera & detection"),
 ]
@@ -156,6 +164,314 @@ class GridOverlay(QWidget):
                 p.drawText(c * s + 3, r * s + 12, f"{chr(ord('A') + c)}{r + 1}")
 
 
+class TargetRow(QWidget):
+    """A saved-target list row: a name label that turns into an in-place edit
+    field when the pencil is clicked (no popup), plus the pencil button."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self._committing = False
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 0, 2, 0)
+        self.label = QLabel(name)
+        self.edit = QLineEdit(name)
+        self.edit.hide()
+        lay.addWidget(self.label, 1)
+        lay.addWidget(self.edit, 1)
+        self.pencil = QPushButton("✎")
+        self.pencil.setFixedSize(26, 22)
+        self.pencil.setToolTip("Rename")
+        lay.addWidget(self.pencil)
+        self.pencil.clicked.connect(self._start_edit)
+        self.edit.editingFinished.connect(self._finish_edit)
+
+    def name(self) -> str:
+        return self.label.text()
+
+    def _start_edit(self) -> None:
+        self.edit.setText(self.label.text())
+        self.label.hide()
+        self.edit.show()
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    def _finish_edit(self) -> None:
+        if self._committing:   # editingFinished re-fires when we drop focus
+            return
+        self._committing = True
+        text = self.edit.text().strip()
+        if text:
+            self.label.setText(text)
+        self.edit.hide()
+        self.label.show()
+        self._committing = False
+
+
+TARGET_MIME = "application/x-pendant-target"
+CANVAS_BG = "#1f2227"
+
+
+class EdgeItem(QGraphicsPathItem):
+    """A directed arrow between two nodes; re-routes via the nearest pair of
+    ports whenever either node moves."""
+
+    def __init__(self, src: "NodeItem", dst: "NodeItem") -> None:
+        super().__init__()
+        self.src = src
+        self.dst = dst
+        self.setZValue(-1)
+        src.scene().addItem(self)
+        src.add_edge(self)
+        dst.add_edge(self)
+        self.update_path()
+
+    def _ends(self):
+        best, bd = None, float("inf")
+        for s in ("top", "right", "bottom", "left"):
+            ps = self.src.port_scene(s)
+            for d in ("top", "right", "bottom", "left"):
+                pd = self.dst.port_scene(d)
+                dist = (ps.x() - pd.x()) ** 2 + (ps.y() - pd.y()) ** 2
+                if dist < bd:
+                    bd, best = dist, (ps, pd)
+        return best
+
+    def update_path(self) -> None:
+        a, b = self._ends()
+        path = QPainterPath(a)
+        path.lineTo(b)
+        self.setPath(path)
+
+    def boundingRect(self):
+        return self.path().boundingRect().adjusted(-14, -14, 14, 14)
+
+    def paint(self, p, opt, widget=None):
+        import math
+        a, b = self._ends()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#cfd6e0"), 2))
+        p.drawLine(a, b)
+        ang = math.atan2(b.y() - a.y(), b.x() - a.x())
+        s = 11
+        p1 = QPointF(b.x() - s * math.cos(ang - math.pi / 6),
+                     b.y() - s * math.sin(ang - math.pi / 6))
+        p2 = QPointF(b.x() - s * math.cos(ang + math.pi / 6),
+                     b.y() - s * math.sin(ang + math.pi / 6))
+        p.setBrush(QBrush(QColor("#cfd6e0")))
+        p.drawPolygon(QPolygonF([b, p1, p2]))
+
+
+class NodeItem(QGraphicsItem):
+    """A flowchart node (a saved target): a white box outlined in the canvas
+    colour. Hovering reveals 4 mid-side ports you can drag to another node."""
+    W, H, PORT_R, MARGIN = 124, 46, 5, 12
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+        self._hover = False
+        self._connecting = False
+        self._temp = None
+        self._start = None
+        self.edges: list = []
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setAcceptHoverEvents(True)
+
+    def add_edge(self, e):
+        self.edges.append(e)
+
+    def boundingRect(self):
+        m = self.MARGIN
+        return QRectF(-m, -m, self.W + 2 * m, self.H + 2 * m)
+
+    def _ports(self):
+        return {
+            "top": QPointF(self.W / 2, 0),
+            "bottom": QPointF(self.W / 2, self.H),
+            "left": QPointF(0, self.H / 2),
+            "right": QPointF(self.W, self.H / 2),
+        }
+
+    def port_scene(self, side):
+        return self.mapToScene(self._ports()[side])
+
+    def paint(self, p, opt, widget=None):
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor("white")))
+        p.setPen(QPen(QColor(CANVAS_BG), 2))
+        p.drawRoundedRect(QRectF(0, 0, self.W, self.H), 7, 7)
+        p.setPen(QColor("#1b1b1b"))
+        p.drawText(QRectF(0, 0, self.W, self.H), Qt.AlignmentFlag.AlignCenter, self.name)
+        if self._hover or self._connecting:
+            p.setBrush(QBrush(QColor("#2a7fff")))
+            p.setPen(QPen(QColor("white"), 1))
+            for pt in self._ports().values():
+                p.drawEllipse(pt, self.PORT_R, self.PORT_R)
+
+    def hoverEnterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def hoverLeaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def _port_at(self, pos):
+        for side, pt in self._ports().items():
+            if (pos - pt).manhattanLength() <= self.PORT_R * 3:
+                return side
+        return None
+
+    def mousePressEvent(self, e):
+        side = self._port_at(e.pos())
+        if side is not None:               # start an arrow from this port
+            self._connecting = True
+            self._start = self.port_scene(side)
+            self._temp = QGraphicsLineItem()
+            self._temp.setPen(QPen(QColor("#2a7fff"), 2, Qt.PenStyle.DashLine))
+            self.scene().addItem(self._temp)
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._connecting:
+            self._temp.setLine(self._start.x(), self._start.y(),
+                               e.scenePos().x(), e.scenePos().y())
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._connecting:
+            if self._temp is not None:
+                self.scene().removeItem(self._temp)
+                self._temp = None
+            self._connecting = False
+            target = next((it for it in self.scene().items(e.scenePos())
+                           if isinstance(it, NodeItem) and it is not self), None)
+            if target is not None:
+                EdgeItem(self, target)
+            self.update()
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            for ed in self.edges:
+                ed.update_path()
+                ed.update()
+        return super().itemChange(change, value)
+
+
+class MotionCanvas(QGraphicsView):
+    """Flowchart canvas: drop targets as nodes, drag mid-side ports to connect,
+    Ctrl+wheel / pinch to zoom."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scene_ = QGraphicsScene(self)
+        self.scene_.setSceneRect(-2000, -2000, 4000, 4000)
+        self.setScene(self.scene_)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setAcceptDrops(True)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setStyleSheet(f"background: {CANVAS_BG};")
+        self._zoom = 1.0
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasFormat(TARGET_MIME):
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasFormat(TARGET_MIME):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if not e.mimeData().hasFormat(TARGET_MIME):
+            return
+        name = bytes(e.mimeData().data(TARGET_MIME)).decode()
+        p = self.mapToScene(e.position().toPoint())
+        self.add_node(name, p.x(), p.y())
+        e.acceptProposedAction()
+
+    def add_node(self, name: str, x: float, y: float) -> "NodeItem":
+        node = NodeItem(name)
+        node.setPos(x - NodeItem.W / 2, y - NodeItem.H / 2)
+        self.scene_.addItem(node)
+        return node
+
+    def _zoom_by(self, f: float) -> None:
+        new = self._zoom * f
+        if 0.25 <= new <= 4.0:
+            self._zoom = new
+            self.scale(f, f)
+
+    def wheelEvent(self, e):
+        if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._zoom_by(1.0015 ** e.angleDelta().y())
+            e.accept()
+        else:
+            super().wheelEvent(e)
+
+    def event(self, e):
+        if (e.type() == QEvent.Type.NativeGesture and
+                e.gestureType() == Qt.NativeGestureType.ZoomNativeGesture):
+            self._zoom_by(1.0 + e.value())
+            return True
+        return super().event(e)
+
+
+class TargetPaletteItem(QFrame):
+    """A target box in the Motion palette: name + a hover-revealed blue '?'
+    badge whose tooltip lists the target's X/Y/Z (or joints). Draggable onto
+    the canvas."""
+
+    def __init__(self, name: str, info_html: str) -> None:
+        super().__init__()
+        self._name = name
+        self.setFixedHeight(38)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        # White box outlined in the canvas colour, dark text (matches the
+        # nodes once dropped on the canvas).
+        self.setStyleSheet(
+            f"QFrame {{ background: white; border: 1px solid {CANVAS_BG};"
+            f" border-radius: 6px; }}"
+            " QLabel { color: #1b1b1b; background: transparent; border: none; }"
+        )
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 4, 6, 4)
+        lay.addWidget(QLabel(name), 1)
+        self.badge = QLabel("?")
+        self.badge.setFixedSize(18, 18)
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.badge.setStyleSheet(
+            "background: #2a7fff; color: white; border-radius: 9px; font-weight: bold;"
+        )
+        self.badge.setToolTip(info_html)
+        self.badge.hide()
+        lay.addWidget(self.badge)
+
+    def enterEvent(self, e):
+        self.badge.show()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.badge.hide()
+        super().leaveEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() & Qt.MouseButton.LeftButton:
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(TARGET_MIME, self._name.encode())
+            drag.setMimeData(mime)
+            drag.exec(Qt.DropAction.CopyAction)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, node: PendantBridge, backend) -> None:
         super().__init__()
@@ -176,6 +492,7 @@ class MainWindow(QMainWindow):
         self.jog_mode = "joint"     # 'joint' | 'cartesian'
         self.jog_group = 0          # 0 -> joints 1-3, 1 -> joints 4-6
         self._dial7_pending: float | None = None  # joint-7 dial target to flush
+        self._target_seq = 0        # running counter for default posN names
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -302,7 +619,8 @@ class MainWindow(QMainWindow):
         rcol.setSpacing(0)
         self.mode_stack = QStackedWidget()
         for builder in (self._build_jogging_tab, self._build_drawing_tab,
-                        self._build_status_tab, self._build_settings_tab):
+                        self._build_motion_tab, self._build_status_tab,
+                        self._build_settings_tab):
             self.mode_stack.addWidget(builder())
         rcol.addWidget(self.mode_stack, 1)
         rcol.addWidget(self._build_estop_bar())
@@ -355,6 +673,8 @@ class MainWindow(QMainWindow):
             self.mode_stack.setCurrentIndex(view)
             self._nav_buttons[view].setChecked(True)
             self._fade_in(self.mode_stack.currentWidget())
+            if _MODES[view][0] == "Motion":
+                self._refresh_motion_palette()
         self.back_btn.setEnabled(self._hist_idx > 0)
         self.fwd_btn.setEnabled(self._hist_idx < len(self._history) - 1)
 
@@ -500,7 +820,11 @@ class MainWindow(QMainWindow):
         self.group_toggle_btn.setStyleSheet(sel_qss)
         self.group_toggle_btn.setGeometry(kx, 6 + S, 150, 42)     # K2
 
-        speed = QWidget(w)
+        self.jog_home_btn = QPushButton("Home", w)                # K3
+        self.jog_home_btn.clicked.connect(lambda: self.node.goto_preset("Home"))
+        self.jog_home_btn.setGeometry(kx, 6 + 2 * S, 150, 42)
+
+        speed = QWidget(w)                                        # K4
         sl = QHBoxLayout(speed)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.addWidget(QLabel("Speed:"))
@@ -509,11 +833,11 @@ class MainWindow(QMainWindow):
         self.jog_speed.setSingleStep(0.1)
         self.jog_speed.setValue(1.0)
         sl.addWidget(self.jog_speed)
-        speed.setGeometry(kx, 6 + 2 * S, 150, 32)                 # K3
+        speed.setGeometry(kx, 6 + 3 * S, 150, 32)
 
-        self.axis_label = QLabel(w)
+        self.axis_label = QLabel(w)                               # K5
         self.axis_label.setStyleSheet("font-family: monospace; font-size: 13px;")
-        self.axis_label.setGeometry(kx, 6 + 3 * S, 150, 90)       # K4
+        self.axis_label.setGeometry(kx, 6 + 4 * S, 150, 90)
 
         # Compact set-joint row at D1 (x = 240); joint mode only.
         self.joint_set_box = QWidget(w)
@@ -557,10 +881,149 @@ class MainWindow(QMainWindow):
         cset.addWidget(cbtn)
         self.cart_set_box.setGeometry(3 * S, 6, 470, 34)
 
+        # Targets window spanning D2 → H4: search / save / recall positions.
+        self.targets_box = QGroupBox("Targets", w)
+        self.targets_box.setStyleSheet(
+            "QPushButton, QLineEdit { min-height: 0px; max-height: 30px; padding: 2px 10px; }"
+        )
+        tv = QVBoxLayout(self.targets_box)
+        tv.setContentsMargins(8, 6, 8, 6)
+        self.target_search = QLineEdit()
+        self.target_search.setPlaceholderText("Search targets…")
+        self.target_search.setClearButtonEnabled(True)
+        self.target_search.textChanged.connect(self._apply_target_filter)
+        tv.addWidget(self.target_search)
+        self.targets_list = QListWidget()
+        tv.addWidget(self.targets_list, 1)
+        brow = QHBoxLayout()
+        save_btn = QPushButton("Save current")
+        save_btn.setStyleSheet(
+            "border: 2px solid #6a7280; border-radius: 6px; background: #3a3f47;"
+            " color: white; padding: 2px 10px;"
+        )
+        save_btn.clicked.connect(self._save_target)
+        go_btn = QPushButton("Go to")
+        go_btn.clicked.connect(self._goto_target)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self._delete_target)
+        brow.addWidget(save_btn)
+        brow.addWidget(go_btn)
+        brow.addWidget(del_btn)
+        tv.addLayout(brow)
+        self.targets_box.setGeometry(3 * S, 1 * S, 5 * S, 3 * S)  # (240, 80, 400, 240)
+
         self._update_jog_ui()
         # Temporary layout aid: faint labelled grid over everything on this page.
         self.jog_grid = GridOverlay(w)
         return w
+
+    def _save_target(self) -> None:
+        self._target_seq += 1
+        name = f"pos{self._target_seq}"   # default name; rename via the pencil
+        joints = list(self.node.get_joints())
+        xyz = self.node.get_ee_xyz()      # may be None if no /ee_pose yet
+        # No display text on the item itself — the row widget draws the name,
+        # so the delegate doesn't double-draw it behind the widget.
+        item = QListWidgetItem()
+        item.setData(Qt.ItemDataRole.UserRole, {"joints": joints, "xyz": xyz})
+        item.setToolTip("  ".join(f"{q:+.3f}" for q in joints))
+        item.setSizeHint(QSize(0, 30))
+        self.targets_list.addItem(item)
+        self.targets_list.setItemWidget(item, TargetRow(name))
+        self._apply_target_filter()
+
+    def _apply_target_filter(self) -> None:
+        q = self.target_search.text().strip().lower()
+        for i in range(self.targets_list.count()):
+            it = self.targets_list.item(i)
+            row = self.targets_list.itemWidget(it)
+            name = row.name() if isinstance(row, TargetRow) else ""
+            it.setHidden(q not in name.lower())
+
+    def _goto_target(self) -> None:
+        item = self.targets_list.currentItem()
+        if item is None:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole) or {}
+        self.node.move_to_joints(data.get("joints"))
+
+    # ── shared target access (used by Motion) ─────────────────────────────
+    def _iter_targets(self):
+        out = []
+        for i in range(self.targets_list.count()):
+            it = self.targets_list.item(i)
+            row = self.targets_list.itemWidget(it)
+            name = row.name() if isinstance(row, TargetRow) else f"pos{i + 1}"
+            out.append((name, it.data(Qt.ItemDataRole.UserRole) or {}))
+        return out
+
+    def _target_info_html(self, data: dict) -> str:
+        as_joints = (getattr(self, "info_joints_check", None) is not None
+                     and self.info_joints_check.isChecked())
+        if as_joints and data.get("joints"):
+            return "<br>".join(f"{n} = {q:+.3f}"
+                               for n, q in zip(JOINT_NAMES, data["joints"]))
+        xyz = data.get("xyz")
+        if xyz:
+            return f"X = {xyz[0]:+.3f}<br>Y = {xyz[1]:+.3f}<br>Z = {xyz[2]:+.3f}"
+        return "(no pose captured)"
+
+    # ── Motion page ────────────────────────────────────────────────────────
+    def _build_motion_tab(self) -> QWidget:
+        w = QWidget()
+        main = QHBoxLayout(w)
+
+        left = QVBoxLayout()
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Task:"))
+        self.task_name = QLineEdit()
+        self.task_name.setPlaceholderText("task name")
+        top.addWidget(self.task_name)
+        new_btn = QPushButton("New")
+        new_btn.clicked.connect(self._motion_new_task)
+        top.addWidget(new_btn)
+        top.addStretch(1)
+        left.addLayout(top)
+        self.motion_canvas = MotionCanvas()
+        left.addWidget(self.motion_canvas, 1)
+        main.addLayout(left, 1)
+
+        palette_box = QGroupBox("Targets")
+        palette_box.setFixedWidth(220)
+        pv = QVBoxLayout(palette_box)
+        hint = QLabel("Drag a target onto the canvas.")
+        hint.setStyleSheet("color: #999; font-size: 11px;")
+        hint.setWordWrap(True)
+        pv.addWidget(hint)
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        inner = QWidget()
+        self.motion_palette_layout = QVBoxLayout(inner)
+        self.motion_palette_layout.setSpacing(6)
+        self.motion_palette_layout.addStretch(1)
+        area.setWidget(inner)
+        pv.addWidget(area, 1)
+        main.addWidget(palette_box)
+        return w
+
+    def _motion_new_task(self) -> None:
+        self.motion_canvas.scene_.clear()
+
+    def _refresh_motion_palette(self) -> None:
+        lay = self.motion_palette_layout
+        while lay.count() > 1:                     # keep the trailing stretch
+            it = lay.takeAt(0)
+            wdg = it.widget()
+            if wdg is not None:
+                wdg.deleteLater()
+        for name, data in self._iter_targets():
+            lay.insertWidget(lay.count() - 1,
+                             TargetPaletteItem(name, self._target_info_html(data)))
+
+    def _delete_target(self) -> None:
+        row = self.targets_list.currentRow()
+        if row >= 0:
+            self.targets_list.takeItem(row)
 
     def _toggle_jog_mode(self) -> None:
         self.jog_mode = "cartesian" if self.jog_mode == "joint" else "joint"
@@ -734,6 +1197,12 @@ class MainWindow(QMainWindow):
         self.backend_status = QLabel("simulation: stopped")
         sim.addWidget(self.backend_status)
         outer.addWidget(sim_box)
+
+        opt_box = QGroupBox("Targets")
+        ov = QVBoxLayout(opt_box)
+        self.info_joints_check = QCheckBox("Show target info as joints (else X/Y/Z)")
+        ov.addWidget(self.info_joints_check)
+        outer.addWidget(opt_box)
 
         info_box = QGroupBox("Environment")
         info = QVBoxLayout(info_box)

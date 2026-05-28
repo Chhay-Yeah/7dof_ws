@@ -107,11 +107,21 @@ def generate_launch_description():
         )),
     )
 
+    # Live IK for Cartesian jog only (drawing uses the offline batch planner).
+    # null_k=0 removes the q_mid null-space pull that otherwise leaves a steady
+    # following error and prevents convergence; relaxed tolerances + more inner
+    # iterations let it actually reach the target and DEACTIVATE when settled,
+    # so it stops commanding the controller (no Cartesian wobble, and it no
+    # longer fights direct joint jog by pulling the arm back).
     ik_node = Node(
         package="arm_bot", executable="ik_arm_v3.py", name="ik_7dof_v3",
         output="screen",
         parameters=[{"base_link": base_link, "tip_link": tip_link,
-                     "use_sim_time": sim_time}],
+                     "use_sim_time": sim_time,
+                     "null_k": 0.0,
+                     "inner_iters": 8,
+                     "tol_pos": 0.002,
+                     "tol_rot": 0.01}],
     )
     fk_node = Node(
         package="arm_bot", executable="fk_arm_v3.py", name="fk_7dof_v3",

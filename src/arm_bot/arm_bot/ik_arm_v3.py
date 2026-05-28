@@ -69,6 +69,14 @@ class IKNode(Node):
         jw = list(self.get_parameter("joint_weights").value)
         self._joint_weights = (np.array(jw, dtype=float)
                                if len(jw) > 1 else None)
+        # Convergence tolerances. The defaults are very tight (10 µm / ~0.006°);
+        # for live jogging that's effectively unreachable, so the node would
+        # never deactivate and would keep commanding the controller forever —
+        # fighting direct joint commands and wobbling. Relax them for jog use.
+        self.declare_parameter("tol_pos", self.TOL_POS)
+        self.declare_parameter("tol_rot", self.TOL_ROT)
+        self._tol_pos = float(self.get_parameter("tol_pos").value)
+        self._tol_rot = float(self.get_parameter("tol_rot").value)
 
         self._chain: UrdfChain | None = None
         self._joint_index = None
@@ -167,8 +175,8 @@ class IKNode(Node):
             e_r = self.ROT_GAIN * rot_error(T_cur[:3, :3], self._T_des[:3, :3])
 
             err_norm = np.sqrt(np.linalg.norm(e_p)**2 + np.linalg.norm(e_r)**2)
-            if (np.linalg.norm(e_p) < self.TOL_POS and
-                np.linalg.norm(e_r) < self.TOL_ROT):
+            if (np.linalg.norm(e_p) < self._tol_pos and
+                np.linalg.norm(e_r) < self._tol_rot):
                 self._active = False
                 break
 
