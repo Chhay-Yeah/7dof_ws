@@ -167,3 +167,54 @@ ros2 run tf2_ros tf2_echo base_link ee
 - `moveit_controllers.yaml` maps MoveIt → `arm_controller` (JointTrajectoryController)
 - `initial_positions.yaml` sets home pose; used by fake hardware in `demo.launch.py`
 - Warehouse (MongoDB) configured for trajectory storage via `warehouse_db.launch.py`
+
+## Pendant Contract (what `teach_pendant/` depends on)
+
+The `7dof-pendant` GUI (`teach_pendant/`, pip package `pendant7dof`) imports **no**
+robot node — it couples to this workspace only through (1) a ROS name/type
+contract, (2) the `pendant_backend.launch.py` graph, and (3) the fact that it
+`colcon build`s the **whole** workspace on launch. So "I didn't touch a pendant
+node" is **not** a safe test. Before changing the robot, check it against this
+contract. (Backend = `simulation only`; the `ros2_control` hardware interface is
+`ign_ros2_control`/`gz_ros2_control` — there is no real-hardware driver.)
+
+**Backend launch graph** — "Simulation ON" runs `ros2 launch arm_bot
+pendant_backend.launch.py`, which starts exactly: `gazebo.launch.py` (mode
+`gazebo`) **or** `arm_moveit_config demo.launch.py` (mode `moveit`),
+`rviz.launch.py`, the `joint_state_broadcaster` + `arm_controller` spawners, and
+`ik_arm_v3.py` + `fk_arm_v3.py` + `ik_to_trajectory.py` + `drawing_batch_planner.py`
+(the last carries a tuned param block copied from `draw_and_execute_batch.launch.py`
+— keep in sync). Editing any of these, or anything they include, breaks the pendant.
+
+**Interface contract** (hardcoded in `pendant7dof/ros_bridge.py` + the launch defaults):
+- Joint names `joint_1`…`joint_7`; controller named `arm_controller`; `base_link` →
+  tip `ee`; `joint_6` limit `[-0.48, 0.26]` (the bridge keeps its own `JOINT_LIMITS` copy).
+- Topics/types: `/arm_controller/joint_trajectory`, `/joint_states`, `/joint_commands`,
+  `/ee_pose`, `/ee_target`, `drawing/strokes`, `/cartesian_path`, `/pen_canvas_norm`.
+
+**Safe to modify freely** (pendant unaffected):
+- Nodes the backend graph never starts: `slider_controller.py`, the *live*
+  `drawing_trajectory_planner.py`/`drawing_executor_node`, `moveit_client.py`,
+  `cartesian_path.py`, `relay_node.py`, and the C++ demos (`move_program.cpp`,
+  `cartisian_move.cpp`).
+- Internal logic of **any** node (incl. the four it uses) as long as published/
+  subscribed topics, their types, and param names stay the same.
+- Meshes/collision/inertial/colors/physics tuning — as long as joint & link **names**
+  and the kinematic chain are unchanged.
+- Adding new nodes/topics/launch files/packages the pendant doesn't reference.
+
+**Breaks the pendant** (even though it's "not a pendant node"):
+- Renaming any `joint_N`/link, renaming `arm_controller`, or changing its joint
+  list/interfaces in `arm_robot_controllers.yaml`.
+- Changing the `ee`/`base_link` names or the URDF chain (IK/FK read `/robot_description`),
+  or changing joint limits (bridge clamp silently disagrees).
+- Renaming/retyping any contract topic; editing `pendant_backend.launch.py` or its
+  includes (`gazebo.launch.py`, controllers yaml, URDF) or the four nodes it spawns.
+- **Any change that fails to build** in `arm_bot` or `arm_moveit_config` — the
+  on-launch `colcon build` halts the pendant.
+
+**Gotchas:** a joint/link/limit rename forces an edit to **pendant** files
+(`ros_bridge.py` `JOINT_NAMES`/`JOINT_LIMITS`, launch `tip_link` default) anyway.
+A bundled/self-contained wheel builds its **bundled** `src/` copy, not live
+`~/7dof_ws` — edits need a re-`bundle` or `PENDANT7DOF_WS=~/7dof_ws` (default
+non-bundled install uses the live workspace).
