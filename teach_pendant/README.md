@@ -32,6 +32,36 @@ pip install .
 > The wheel ships only the GUI + robot source — it does **not** contain ROS.
 > Install the system ROS dependencies first with `./install.sh` (see below).
 
+## Uninstall
+
+```bash
+pip uninstall 7dof-pendant
+```
+
+This removes the package and the `7dof-pendant` command, but **not** two
+things:
+
+- **Colcon build artifacts.** On first launch the pendant runs `colcon build`
+  *inside* its bundled workspace, creating `build/`, `install/`, and `log/`
+  directories that pip never recorded — so `pip uninstall` leaves them behind.
+  Remove them too:
+
+  ```bash
+  WS=$(python3 -c "import pendant7dof, os; print(os.path.join(os.path.dirname(pendant7dof.__file__), 'workspace'))")
+  pip uninstall -y 7dof-pendant
+  rm -rf "$WS"
+  ```
+
+  (Run the `WS=…` line *before* uninstalling — once the package is gone the
+  import fails. If you already uninstalled, the leftovers live under
+  `~/.local/lib/python*/site-packages/pendant7dof/`.)
+
+- **Dependencies.** PyQt6 is left installed. Remove it only if nothing else
+  uses it: `pip uninstall -y PyQt6 PyQt6-Qt6 PyQt6-sip`.
+
+ROS 2 itself (`/opt/ros/...`) was installed via `apt`/`install.sh`, not pip, so
+it is unaffected.
+
 ## Requirements
 
 ROS 2 **Humble** must be installed on the machine. The pendant **cannot** bring
