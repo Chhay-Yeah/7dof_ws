@@ -21,14 +21,16 @@ for you on first launch.
 
 ### One-shot setup (`install.sh`)
 
-For a real-hardware box, `./install.sh` (run from `teach_pendant/`) installs
-every ROS dependency the pendant needs to build and run — **without** RViz or
-Gazebo — via `rosdep` (skipping the GUI/sim keys), plus the undeclared Python
-deps (`numpy`, `scipy`, `urdf_parser_py`), then installs the pendant editable and
+`./install.sh` (run from `teach_pendant/`) installs every ROS dependency the
+pendant needs to build and run via `rosdep`, plus the undeclared Python deps
+(`numpy`, `scipy`, `urdf_parser_py`), then installs the pendant editable and
 builds the workspace. It requires ROS 2 already installed under `/opt/ros`.
-Use `./install.sh --no-build` to skip the colcon build. (Note: it still installs
-MoveIt's *planning interface* — `arm_bot` won't compile without it — but that
-does not pull RViz/Gazebo.)
+Use `./install.sh --no-build` to skip the colcon build.
+
+It supports **real-hardware** control and the **`moveit` (RViz fake-hardware)
+simulation** — RViz and MoveIt are installed. It deliberately **skips
+Gazebo/Ignition**, so the `gazebo` physics-sim backend is not available; use
+`moveit` mode (Settings → mode) for RViz-based testing.
 
 ## How it works
 

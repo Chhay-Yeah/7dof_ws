@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 #
-# install.sh — one-shot setup for the 7dof-pendant on a fresh machine, aimed at
-# REAL-HARDWARE control. It installs the ROS dependencies the pendant needs to
-# build and run, then installs the pendant itself.
+# install.sh — one-shot setup for the 7dof-pendant on a fresh machine. Installs
+# the ROS dependencies the pendant needs to build and run, then the pendant.
 #
-#   * Does NOT install RViz or Gazebo — those are only for simulation testing on
-#     a dev box and are skipped here on purpose.
-#   * Still installs MoveIt's *planning interface* and ros2_control: arm_bot's
-#     CMakeLists does `find_package(moveit_ros_planning_interface REQUIRED)`, and
-#     the pendant colcon-builds the whole workspace on first launch, so those are
-#     required to BUILD — none of them pull RViz/Gazebo.
+# Supports two of the pendant's three backends:
+#   * REAL-HARDWARE control (the deployment target), and
+#   * the RViz "moveit" simulation (MoveIt + fake ros2_control hardware + MoveIt
+#     RViz) for testing the app's functions on a dev box.
+#
+#   * Does NOT install Gazebo/Ignition — the `gazebo` backend (physics sim) is
+#     intentionally excluded. RViz + MoveIt ARE installed so the `moveit` mode
+#     works. (rosdep skips only the Gazebo/Ignition keys below.)
+#   * Installs MoveIt's planning interface + ros2_control because arm_bot's
+#     CMakeLists does `find_package(moveit_ros_planning_interface REQUIRED)` and
+#     the pendant colcon-builds the whole workspace on first launch.
 #
 # Prerequisite: ROS 2 (default: Humble) already installed under /opt/ros.
 #
@@ -54,15 +58,16 @@ sudo apt-get install -y \
   python3-colcon-common-extensions python3-rosdep python3-pip \
   build-essential cmake git
 
-# ── 2. workspace ROS deps via rosdep, minus all RViz/Gazebo/GUI keys ──────────
+# ── 2. workspace ROS deps via rosdep, minus Gazebo/Ignition only ──────────────
 # rosdep reads every package.xml and installs the matching apt packages. We skip
-# the GUI/sim keys so a headless real-hardware box stays lean.
-SKIP_KEYS="rviz2 rviz_common rviz_default_plugins \
-ros_gz_sim ros_gz_bridge ign_ros2_control gazebo_ros gazebo_ros2_control \
-joint_state_publisher joint_state_publisher_gui \
-moveit_ros_visualization moveit_setup_assistant warehouse_ros_mongo"
+# the Gazebo/Ignition keys (physics-sim backend, not used here). RViz + MoveIt
+# are kept so the `moveit` (RViz fake-hardware) simulation works. The two extra
+# skips are dev/heavy-only: moveit_setup_assistant (config-gen tool, not needed
+# at runtime) and warehouse_ros_mongo (MongoDB trajectory store, optional).
+SKIP_KEYS="ros_gz_sim ros_gz_bridge ign_ros2_control gazebo_ros gazebo_ros2_control \
+moveit_setup_assistant warehouse_ros_mongo"
 
-log "resolving workspace dependencies with rosdep (skipping RViz/Gazebo/GUI)…"
+log "resolving workspace dependencies with rosdep (skipping Gazebo/Ignition)…"
 sudo rosdep init 2>/dev/null || true     # harmless if already initialised
 rosdep update
 rosdep install --from-paths "$WS_ROOT/src" --ignore-src -y \
@@ -98,10 +103,14 @@ cat <<EOF
 
 [install] Done. Make sure ~/.local/bin is on your PATH, then launch with:
 
-    7dof-pendant launch --no-build          # attach to a real-hardware bringup
-    7dof-pendant                            # (dev) auto-start sim backend if present
+    7dof-pendant                  # open the pendant
+      └ Settings → mode 'moveit', then Simulation ON  → RViz fake-hardware sim
+      └ for REAL hardware: bring up your hardware stack, then
+        7dof-pendant launch --no-backend                # attach to it
 
-Reminder: driving the PHYSICAL arm needs a real ros2_control hardware driver +
-bringup that this repo does not yet provide; until then the pendant only talks
-to the simulation backend on a dev machine.
+Notes:
+  * The 'gazebo' physics-sim mode is NOT supported by this install (Gazebo was
+    skipped on purpose). Use 'moveit' mode for RViz-based testing.
+  * Driving the PHYSICAL arm needs a real ros2_control hardware driver + bringup
+    that this repo does not yet provide.
 EOF
