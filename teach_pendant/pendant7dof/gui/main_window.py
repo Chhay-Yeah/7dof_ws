@@ -28,7 +28,7 @@ from PyQt6.QtGui import (
     QPainterPath, QPolygonF, QPainterPathStroker, QFontMetricsF,
 )
 
-from .. import bootstrap
+from .. import bootstrap, store
 from ..ros_bridge import PendantBridge, JOINT_NAMES
 from .drawing_canvas import CanvasView, DEFAULT_WORKSPACE_MM
 from .joystick import Joystick
@@ -40,6 +40,11 @@ DEFAULT_Z_PAPER_OFFSET_MM = 0.0
 # Per-tick jog scale at the joystick rate (full stick deflection).
 JOINT_STEP_PER_TICK = 0.012   # rad
 CART_STEP_PER_TICK = 0.0015   # m
+
+# Seconds commanded for each Motion-sequence move. The executor waits this long
+# for one move to finish before issuing the next, so it must match the duration
+# handed to move_to_joints().
+MOTION_MOVE_S = 2.5
 
 # Active modes (title, blurb). Order == sidebar order == mode_stack index.
 _MODES = [
@@ -125,9 +130,10 @@ class TargetRow(QWidget):
     """A saved-target list row: a name label that turns into an in-place edit
     field when the pencil is clicked (no popup), plus the pencil button."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, on_renamed=None) -> None:
         super().__init__()
         self._committing = False
+        self._on_renamed = on_renamed
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 0, 2, 0)
         self.label = QLabel(name)
@@ -157,11 +163,14 @@ class TargetRow(QWidget):
             return
         self._committing = True
         text = self.edit.text().strip()
+        changed = bool(text) and text != self.label.text()
         if text:
             self.label.setText(text)
         self.edit.hide()
         self.label.show()
         self._committing = False
+        if changed and self._on_renamed is not None:
+            self._on_renamed()
 
 
 TARGET_MIME = "application/x-pendant-target"
@@ -609,6 +618,12 @@ class MainWindow(QMainWindow):
         self._task_seq = 0          # running counter for default task names
         self._editing_task: int | None = None  # index being edited (None = new)
         self._selected_task: int | None = None  # index selected in the list view
+        # Motion sequence execution state (driven by a chained QTimer).
+        self._motion_running = False
+        self._motion_steps: list[dict] = []
+        self._motion_i = 0
+        self._motion_timer: QTimer | None = None
+        self._loading = False       # suppress _persist() while restoring state
 
         root = QVBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
@@ -634,6 +649,8 @@ class MainWindow(QMainWindow):
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._refresh_status)
         self._poll.start(100)
+
+        self._load_persisted()
 
     def _white_icon(self, std: "QStyle.StandardPixmap") -> QIcon:
         """Standard arrow icons render dark; recolour them white so they show
@@ -828,6 +845,7 @@ class MainWindow(QMainWindow):
                 "background-color: #d33; color: white; font-size: 20px; font-weight: bold;"
             )
         else:
+            self._finish_motion()   # abort any running Motion sequence
             self.node.estop()
             self.estop_btn.setText("RESET (E-stop active)")
             self.estop_btn.setStyleSheet(
@@ -1033,15 +1051,22 @@ class MainWindow(QMainWindow):
         name = f"pos{self._target_seq}"   # default name; rename via the pencil
         joints = list(self.node.get_joints())
         xyz = self.node.get_ee_xyz()      # may be None if no /ee_pose yet
+        self._add_target_row(name, {"joints": joints, "xyz": xyz})
+        self._apply_target_filter()
+        self._persist()
+
+    def _add_target_row(self, name: str, data: dict) -> None:
+        """Append a saved-target row backed by ``data`` (``{"joints", "xyz"}``).
+        Shared by the live Save button and state restore on startup."""
         # No display text on the item itself — the row widget draws the name,
         # so the delegate doesn't double-draw it behind the widget.
         item = QListWidgetItem()
-        item.setData(Qt.ItemDataRole.UserRole, {"joints": joints, "xyz": xyz})
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        joints = data.get("joints") or []
         item.setToolTip("  ".join(f"{q:+.3f}" for q in joints))
         item.setSizeHint(QSize(0, 30))
         self.targets_list.addItem(item)
-        self.targets_list.setItemWidget(item, TargetRow(name))
-        self._apply_target_filter()
+        self.targets_list.setItemWidget(item, TargetRow(name, self._persist))
 
     def _apply_target_filter(self) -> None:
         q = self.target_search.text().strip().lower()
@@ -1078,6 +1103,50 @@ class MainWindow(QMainWindow):
         if xyz:
             return f"X = {xyz[0]:+.3f}<br>Y = {xyz[1]:+.3f}<br>Z = {xyz[2]:+.3f}"
         return "(no pose captured)"
+
+    # ── persistence (targets + tasks) ─────────────────────────────────────
+    def _persist(self) -> None:
+        """Write saved targets, Motion tasks and the name counters to disk.
+        A no-op while state is being restored (``self._loading``)."""
+        if self._loading:
+            return
+        targets = [{"name": name, "joints": data.get("joints"),
+                    "xyz": data.get("xyz")}
+                   for name, data in self._iter_targets()]
+        store.save_state({
+            "targets": targets,
+            "tasks": self._tasks,
+            "target_seq": self._target_seq,
+            "task_seq": self._task_seq,
+        })
+
+    def _load_persisted(self) -> None:
+        state = store.load_state()
+        if not state:
+            return
+        self._loading = True
+        try:
+            for t in state.get("targets", []):
+                if not isinstance(t, dict) or "name" not in t:
+                    continue
+                xyz = t.get("xyz")
+                self._add_target_row(t["name"], {
+                    "joints": t.get("joints"),
+                    "xyz": tuple(xyz) if xyz else None,
+                })
+            tasks = state.get("tasks")
+            if isinstance(tasks, list):
+                self._tasks = tasks
+            self._target_seq = int(state.get("target_seq", self._target_seq))
+            self._task_seq = int(state.get("task_seq", self._task_seq))
+        finally:
+            self._loading = False
+        self._apply_target_filter()
+
+    def closeEvent(self, e) -> None:
+        self._stop_motion()
+        self._persist()
+        super().closeEvent(e)
 
     # ── Motion page ────────────────────────────────────────────────────────
     def _build_motion_tab(self) -> QWidget:
@@ -1156,6 +1225,8 @@ class MainWindow(QMainWindow):
             b = QPushButton(label)
             b.clicked.connect(slot)
             bar.addWidget(b)
+            if label == "Run":
+                self._run_btn = b
         bar.addStretch(1)
         v.addLayout(bar)
 
@@ -1236,6 +1307,7 @@ class MainWindow(QMainWindow):
         else:
             self._tasks.append(task)
             self._selected_task = len(self._tasks) - 1
+        self._persist()
         self._show_task_list()
 
     # ── task list interactions ────────────────────────────────────────────
@@ -1293,6 +1365,7 @@ class MainWindow(QMainWindow):
         task["name"] = task["name"] + " copy"
         self._tasks.insert(self._selected_task + 1, task)
         self._selected_task += 1
+        self._persist()
         self._refresh_task_list()
 
     def _task_delete_selected(self) -> None:
@@ -1300,17 +1373,130 @@ class MainWindow(QMainWindow):
             return
         del self._tasks[self._selected_task]
         self._selected_task = None
+        self._persist()
         self._refresh_task_list()
 
+    # ── Motion sequence execution ─────────────────────────────────────────
+    def _build_motion_plan(self, task: dict):
+        """Linearise a task's flowchart into an ordered list of move steps.
+
+        Returns ``(steps, error)``. ``steps`` is a list of
+        ``{"name", "joints", "pre_delay"}`` where ``pre_delay`` is the number
+        of seconds to dwell at the *previous* node before moving here (set by a
+        Timer arrow; 0 for a Sequence arrow or the first node). ``error`` is a
+        human-readable string when the plan can't be built (and ``steps`` is
+        empty).
+
+        Traversal: start at a node with no incoming edge (a fallback to node 0
+        when every node has one, e.g. a loop), then follow the first
+        not-yet-visited outgoing edge at each step — the common case is a single
+        chain. Joint values are resolved by node name from the saved targets.
+        """
+        nodes = task.get("nodes", [])
+        edges = task.get("edges", [])
+        if not nodes:
+            return [], "task has no targets"
+
+        joints_by_name = {name: data.get("joints")
+                          for name, data in self._iter_targets()}
+
+        # adjacency: src index -> list of (dst, kind, delay)
+        adj: dict[int, list] = {i: [] for i in range(len(nodes))}
+        has_incoming = [False] * len(nodes)
+        for ed in edges:
+            s, d = ed.get("src"), ed.get("dst")
+            if s is None or d is None or s >= len(nodes) or d >= len(nodes):
+                continue
+            adj[s].append((d, ed.get("kind", "sequence"), ed.get("delay", 0.0)))
+            has_incoming[d] = True
+
+        start = next((i for i in range(len(nodes)) if not has_incoming[i]), 0)
+
+        steps = []
+        visited = set()
+        cur, pre_delay = start, 0.0
+        while cur is not None and cur not in visited:
+            visited.add(cur)
+            name = nodes[cur].get("name", f"node{cur}")
+            joints = joints_by_name.get(name)
+            if joints is None or len(joints) != 7:
+                return [], (f"target '{name}' has no saved joints — "
+                            f"re-save it in Jogging")
+            steps.append({"name": name, "joints": list(joints),
+                          "pre_delay": pre_delay})
+            nxt = next((e for e in adj[cur] if e[0] not in visited), None)
+            if nxt is None:
+                break
+            cur = nxt[0]
+            pre_delay = float(nxt[2]) if nxt[1] == "timer" else 0.0
+        return steps, None
+
     def _task_run_selected(self) -> None:
-        # Build-only: executing a Motion sequence on the robot is a deferred
-        # phase. Surface the intent without driving anything yet.
-        if self._selected_task is None:
+        if self._motion_running:
+            self._stop_motion()
             return
-        name = self._tasks[self._selected_task]["name"]
+        if self._selected_task is None:
+            self.statusBar().showMessage("Select a task to run.", 3000)
+            return
+        if self.node.estopped:
+            self.statusBar().showMessage(
+                "E-stop is engaged — clear it before running.", 4000)
+            return
+        task = self._tasks[self._selected_task]
+        steps, error = self._build_motion_plan(task)
+        if error:
+            self.statusBar().showMessage(f"Cannot run '{task['name']}': {error}",
+                                         5000)
+            return
+        self._motion_steps = steps
+        self._motion_i = 0
+        self._motion_running = True
+        if hasattr(self, "_run_btn"):
+            self._run_btn.setText("Stop")
+        self._run_step()
+
+    def _run_step(self) -> None:
+        if not self._motion_running:
+            return
+        if self.node.estopped:
+            self.statusBar().showMessage("Motion aborted — E-stop engaged.", 4000)
+            self._finish_motion()
+            return
+        i = self._motion_i
+        if i >= len(self._motion_steps):
+            self.statusBar().showMessage("Motion complete.", 4000)
+            self._finish_motion()
+            return
+        step = self._motion_steps[i]
+        n = len(self._motion_steps)
+        self.node.move_to_joints(step["joints"], MOTION_MOVE_S)
         self.statusBar().showMessage(
-            f"Run '{name}' — sequence execution is not implemented yet "
-            f"(build-only).", 4000)
+            f"Running '{self._tasks[self._selected_task]['name']}': "
+            f"{i + 1}/{n} → {step['name']}")
+        self._motion_i = i + 1
+        # Wait for this move to finish, then dwell for the next edge's timer.
+        wait_s = MOTION_MOVE_S
+        if self._motion_i < n:
+            wait_s += self._motion_steps[self._motion_i]["pre_delay"]
+        self._motion_timer = QTimer(self)
+        self._motion_timer.setSingleShot(True)
+        self._motion_timer.timeout.connect(self._run_step)
+        self._motion_timer.start(int(wait_s * 1000))
+
+    def _stop_motion(self) -> None:
+        if not self._motion_running:
+            return
+        self._finish_motion()
+        self.node.freeze()
+        self.statusBar().showMessage("Motion stopped.", 3000)
+
+    def _finish_motion(self) -> None:
+        self._motion_running = False
+        if self._motion_timer is not None:
+            self._motion_timer.stop()
+            self._motion_timer = None
+        if hasattr(self, "_run_btn"):
+            self._run_btn.setText("Run")
 
     def _build_arrow_picker(self) -> QWidget:
         box = QGroupBox("Arrow")
@@ -1386,6 +1572,7 @@ class MainWindow(QMainWindow):
         row = self.targets_list.currentRow()
         if row >= 0:
             self.targets_list.takeItem(row)
+            self._persist()
 
     def _toggle_jog_mode(self) -> None:
         self.jog_mode = "cartesian" if self.jog_mode == "joint" else "joint"
