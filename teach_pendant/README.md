@@ -14,11 +14,21 @@ custom IK/FK and drawing nodes).
 
 ## Requirements
 
-ROS 2 **Humble** must be installed on the machine (`sudo apt install
-ros-humble-desktop`). The pendant **cannot** bring ROS along inside the wheel —
-`rclpy`, MoveIt, Gazebo and `ros2_control` come from the system install. The
-pendant *does* bundle the robot's ROS 2 source and builds it for you on first
-launch.
+ROS 2 **Humble** must be installed on the machine. The pendant **cannot** bring
+ROS along inside the wheel — `rclpy`, MoveIt and `ros2_control` come from the
+system install. The pendant *does* bundle the robot's ROS 2 source and builds it
+for you on first launch.
+
+### One-shot setup (`install.sh`)
+
+For a real-hardware box, `./install.sh` (run from `teach_pendant/`) installs
+every ROS dependency the pendant needs to build and run — **without** RViz or
+Gazebo — via `rosdep` (skipping the GUI/sim keys), plus the undeclared Python
+deps (`numpy`, `scipy`, `urdf_parser_py`), then installs the pendant editable and
+builds the workspace. It requires ROS 2 already installed under `/opt/ros`.
+Use `./install.sh --no-build` to skip the colcon build. (Note: it still installs
+MoveIt's *planning interface* — `arm_bot` won't compile without it — but that
+does not pull RViz/Gazebo.)
 
 ## How it works
 
