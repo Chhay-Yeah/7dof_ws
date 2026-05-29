@@ -91,6 +91,20 @@ def workspace_is_built(ws: Path) -> bool:
     return (ws / "install" / "setup.bash").is_file()
 
 
+def workspace_is_sourced(ws: Path) -> bool:
+    """True if the workspace's ``install/`` prefix is on AMENT_PREFIX_PATH.
+
+    ``rclpy`` being importable only proves the system ROS environment is
+    sourced — it says nothing about the workspace packages (``arm_bot`` etc.).
+    If the workspace is built but its prefix isn't on the path, ``ros2 launch
+    arm_bot ...`` fails with "package not found", so we must still re-exec to
+    source ``install/setup.bash``.
+    """
+    install_prefix = str((ws / "install").resolve())
+    entries = os.environ.get("AMENT_PREFIX_PATH", "").split(os.pathsep)
+    return any(e and Path(e).resolve() == Path(install_prefix) for e in entries)
+
+
 def build_workspace(ws: Path, ros_setup: Path) -> bool:
     """colcon build the workspace. Returns True on success.
 
@@ -167,7 +181,16 @@ def ensure_environment(build_if_needed: bool = True) -> Path | None:
     already_sourced = os.environ.get(_SENTINEL) == "1"
     ws = resolve_workspace()
 
-    if rclpy_importable() and (ws is None or workspace_is_built(ws)):
+    # The environment is fully ready only when rclpy imports AND the resolved
+    # workspace is both built and on AMENT_PREFIX_PATH. A shell that sources
+    # only /opt/ros (rclpy works) but not the workspace would otherwise fail to
+    # launch arm_bot. Once we've re-exec'd (sentinel set) we never re-exec again
+    # for this reason — trust the sourced child to avoid any loop.
+    ws_ready = ws is None or (
+        workspace_is_built(ws)
+        and (already_sourced or workspace_is_sourced(ws))
+    )
+    if rclpy_importable() and ws_ready:
         return ws
 
     if already_sourced:
