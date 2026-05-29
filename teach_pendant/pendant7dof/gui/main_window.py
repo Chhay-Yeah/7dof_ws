@@ -179,6 +179,15 @@ NODE_BG = "#d8d8d8"       # saved-target fill (dimmed white)
 NODE_BORDER = "#000000"   # saved-target outline (black)
 JOG_AXIS_COLOR = "#ffa726"  # joystick axis label colour (orange)
 
+# Black-outlined, faint-grey button so each Motion control reads as pressable.
+# Shared by the editor's Save/New/Tasks and the task list's toolbar.
+TASK_BTN_QSS = (
+    "QPushButton { border: 1px solid #000000; border-radius: 4px;"
+    " background: #e6e6e6; color: #1b1b1b; padding: 5px 14px; }"
+    "QPushButton:hover { background: #f2f2f2; }"
+    "QPushButton:pressed { background: #d0d0d0; }"
+)
+
 
 class EdgeItem(QGraphicsPathItem):
     """A directed arrow between two nodes. Routed with **orthogonal** segments
@@ -775,20 +784,33 @@ class MainWindow(QMainWindow):
         self._motion_timer: QTimer | None = None
         self._loading = False       # suppress _persist() while restoring state
 
-        root = QVBoxLayout()
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(self._build_top_bar())
+        # Full-height sidebar on the left; the top bar + page content sit in a
+        # column to its right, so the back/forward buttons live inside the
+        # content's top bar and never overlap the sidebar column.
+        self.sidebar = self._build_sidebar()
 
         self.main_stack = QStackedWidget()
         self.launcher = self._build_launcher()
-        self.main_stack.addWidget(self.launcher)
-        self.main_stack.addWidget(self._build_mode_container())
-        root.addWidget(self.main_stack, 1)
+        self.main_stack.addWidget(self.launcher)             # page 0
+        self.main_stack.addWidget(self._build_mode_content())  # page 1
+
+        rcol = QVBoxLayout()
+        rcol.setContentsMargins(0, 0, 0, 0)
+        rcol.setSpacing(0)
+        rcol.addWidget(self._build_top_bar())
+        rcol.addWidget(self.main_stack, 1)
+        right = QWidget()
+        right.setLayout(rcol)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self.sidebar)
+        body.addWidget(right, 1)
 
         container = QWidget()
         container.setStyleSheet(_CONTENT_QSS)
-        container.setLayout(root)
+        container.setLayout(body)
         self.setCentralWidget(container)
 
         for i, btn in enumerate(self._nav_buttons):
@@ -888,16 +910,11 @@ class MainWindow(QMainWindow):
         outer.addStretch(1)
         return w
 
-    # ── mode container: full-height sidebar + (content over E-stop) ───────
-    def _build_mode_container(self) -> QWidget:
+    # ── mode content: the mode stack over the E-stop bar (sidebar is a
+    # separate, full-height column built in __init__) ─────────────────────
+    def _build_mode_content(self) -> QWidget:
         w = QWidget()
-        body = QHBoxLayout(w)
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(0)
-        body.addWidget(self._build_sidebar())
-
-        right = QWidget()
-        rcol = QVBoxLayout(right)
+        rcol = QVBoxLayout(w)
         rcol.setContentsMargins(0, 0, 0, 0)
         rcol.setSpacing(0)
         self.mode_stack = QStackedWidget()
@@ -907,7 +924,6 @@ class MainWindow(QMainWindow):
             self.mode_stack.addWidget(builder())
         rcol.addWidget(self.mode_stack, 1)
         rcol.addWidget(self._build_estop_bar())
-        body.addWidget(right, 1)
         return w
 
     def _build_sidebar(self) -> QWidget:
@@ -950,9 +966,11 @@ class MainWindow(QMainWindow):
     def _apply_view(self, view: int) -> None:
         if view == -1:
             self.main_stack.setCurrentIndex(0)
+            self.sidebar.setVisible(False)   # home screen has no sidebar
             self._fade_in(self.launcher)
         else:
             self.main_stack.setCurrentIndex(1)
+            self.sidebar.setVisible(True)
             self.mode_stack.setCurrentIndex(view)
             self._nav_buttons[view].setChecked(True)
             self._fade_in(self.mode_stack.currentWidget())
@@ -1353,16 +1371,15 @@ class MainWindow(QMainWindow):
         self.task_name.setPlaceholderText("task name")
         top.addWidget(self.task_name)
         save_btn = QPushButton("Save")
-        save_btn.setStyleSheet(
-            "border: 2px solid #6a7280; border-radius: 6px; background: #3a3f47;"
-            " color: white; padding: 4px 14px;"
-        )
+        save_btn.setStyleSheet(TASK_BTN_QSS)
         save_btn.clicked.connect(self._save_task)
         top.addWidget(save_btn)
         new_btn = QPushButton("New")
+        new_btn.setStyleSheet(TASK_BTN_QSS)
         new_btn.clicked.connect(self._motion_new_task)
         top.addWidget(new_btn)
         tasks_btn = QPushButton("Tasks")
+        tasks_btn.setStyleSheet(TASK_BTN_QSS)
         tasks_btn.clicked.connect(self._show_task_list)
         top.addWidget(tasks_btn)
         top.addStretch(1)
@@ -1377,13 +1394,6 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         bar = QHBoxLayout()
-        # Black-outlined, faint-grey buttons so each reads as pressable.
-        task_btn_qss = (
-            "QPushButton { border: 1px solid #000000; border-radius: 4px;"
-            " background: #e6e6e6; color: #1b1b1b; padding: 5px 14px; }"
-            "QPushButton:hover { background: #f2f2f2; }"
-            "QPushButton:pressed { background: #d0d0d0; }"
-        )
         for label, slot in (
             ("Create new Task", self._task_create_new),
             ("Edit", self._task_edit_selected),
@@ -1392,7 +1402,7 @@ class MainWindow(QMainWindow):
             ("Delete", self._task_delete_selected),
         ):
             b = QPushButton(label)
-            b.setStyleSheet(task_btn_qss)
+            b.setStyleSheet(TASK_BTN_QSS)
             b.clicked.connect(slot)
             bar.addWidget(b)
             if label == "Run":

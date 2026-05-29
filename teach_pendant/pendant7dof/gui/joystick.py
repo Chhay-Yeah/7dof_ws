@@ -70,7 +70,9 @@ class Joystick(QWidget):
         # rotary "grab and turn" control (rectangle box with 90-deg stripes).
         p.save()
         p.translate(c)
-        p.rotate(self.twist * 60.0)
+        # Negated so the grip rotates *with* the mouse (Qt's rotate is CW-
+        # positive with y-down, the opposite of the math-convention twist).
+        p.rotate(-self.twist * 60.0)
         grip_col = QColor("#6aa9ff" if self._ring_active else "#4f9bff")
         pad_long = ring_w * 2.6        # tangential length of the grip
         pad_thick = ring_w * 1.6       # radial thickness
