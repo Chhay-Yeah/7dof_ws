@@ -11,15 +11,15 @@ custom IK/FK and drawing nodes).
 ROS 2 **Humble** must already be installed (see [Requirements](#requirements)),
 then install the pendant one of two ways:
 
-**From the latest release (recommended for users):**
+**From PyPI (recommended for users):**
 
 ```bash
-pip install --user https://github.com/Chhay-Yeah/7dof_ws/releases/download/v0.1.0/7dof_pendant-0.1.0-py3-none-any.whl
+pip install --user 7dof-pendant
 7dof-pendant            # ensure ~/.local/bin is on PATH
 ```
 
-The release wheel is self-contained (GUI + bundled robot source). Latest
-releases: <https://github.com/Chhay-Yeah/7dof_ws/releases>.
+The published package is self-contained (GUI + bundled robot source). Project
+page: <https://pypi.org/project/7dof-pendant/>.
 
 **From source (for development):**
 
