@@ -7,4 +7,4 @@ build, and launch. See ``bootstrap.py`` for how the workspace is located and
 ``cli.py`` for the launch flow.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
