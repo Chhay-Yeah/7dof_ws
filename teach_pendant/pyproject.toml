@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "7dof-pendant"
-version = "0.1.1"
+version = "0.1.2"
 description = "Teach pendant GUI for the 7-DOF robotic arm (ROS 2 Humble)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,5 +28,9 @@ include = ["pendant7dof*"]
 
 [tool.setuptools.package-data]
 # Anything copied under pendant7dof/workspace by `7dof-pendant bundle`
-# ships inside the wheel.
-"pendant7dof" = ["workspace/**/*"]
+# ships inside the wheel. The `**/.*` pattern is REQUIRED in addition to
+# `**/*`: setuptools globs with Python's glob, whose `*` never matches names
+# beginning with a dot, so without it dotfiles like
+# arm_moveit_config/.setup_assistant get silently dropped from the wheel and
+# the on-launch colcon build fails (CMake `install(FILES .setup_assistant ...)`).
+"pendant7dof" = ["workspace/**/*", "workspace/**/.*"]
