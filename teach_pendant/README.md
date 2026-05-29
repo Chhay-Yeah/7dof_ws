@@ -1,16 +1,36 @@
 # 7dof-pendant
 
-A pip-installable **teach pendant GUI** for the 7-DOF robotic arm. One install,
-one command:
-
-```bash
-pip install .
-7dof-pendant
-```
+A pip-installable **teach pendant GUI** for the 7-DOF robotic arm.
 
 The app opens a PyQt6 pendant (joint jog, Cartesian jog, presets, drawing, live
 status, E-stop) and drives the ROS 2 backend (Gazebo + ros2_control + the
 custom IK/FK and drawing nodes).
+
+## Install
+
+ROS 2 **Humble** must already be installed (see [Requirements](#requirements)),
+then install the pendant one of two ways:
+
+**From the latest release (recommended for users):**
+
+```bash
+pip install --user https://github.com/Chhay-Yeah/7dof_ws/releases/download/v0.1.0/7dof_pendant-0.1.0-py3-none-any.whl
+7dof-pendant            # ensure ~/.local/bin is on PATH
+```
+
+The release wheel is self-contained (GUI + bundled robot source). Latest
+releases: <https://github.com/Chhay-Yeah/7dof_ws/releases>.
+
+**From source (for development):**
+
+```bash
+cd teach_pendant
+pip install .
+7dof-pendant
+```
+
+> The wheel ships only the GUI + robot source — it does **not** contain ROS.
+> Install the system ROS dependencies first with `./install.sh` (see below).
 
 ## Requirements
 
