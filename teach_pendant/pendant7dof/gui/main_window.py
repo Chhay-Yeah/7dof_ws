@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QDial, QStyle, QCheckBox,
     QListWidget, QListWidgetItem, QScrollArea, QGraphicsOpacityEffect,
     QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsPathItem,
-    QGraphicsLineItem, QRadioButton,
+    QGraphicsLineItem, QRadioButton, QMenu,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QEvent, QRect, QRectF,
@@ -189,6 +189,8 @@ class EdgeItem(QGraphicsPathItem):
 
     TIMER_COLOR = "#f0a020"
     STUB = 22.0   # how far the arrow steps straight out of each port
+    HANDLE = 6.0  # half-size of the square endpoint handles (when selected)
+    GRAB = 18.0   # how close a press must be to an endpoint to grab it
 
     _NORMALS = {
         "top": QPointF(0, -1), "bottom": QPointF(0, 1),
@@ -204,8 +206,11 @@ class EdgeItem(QGraphicsPathItem):
         self.dst_side = self._pick_dst_side()   # fixed once, never auto-switches
         self.kind = "sequence"        # "sequence" | "timer"
         self.delay = 5.0              # seconds, used when kind == "timer"
+        self._drag_end = None         # "src" | "dst" while an endpoint is dragged
+        self._preview = None          # temp dashed line shown while reattaching
         self.setZValue(-1)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
         src.scene().addItem(self)
         src.add_edge(self)
         dst.add_edge(self)
@@ -289,6 +294,16 @@ class EdgeItem(QGraphicsPathItem):
         p.drawPolygon(QPolygonF([b, p1, p2]))
         if self.kind == "timer":
             self._paint_timer_badge(p)
+        if self.isSelected():
+            self._paint_handles(p, pts[0], pts[-1])
+
+    def _paint_handles(self, p, a, b) -> None:
+        """Square grips at both endpoints — drag to reattach the arrow."""
+        h = self.HANDLE
+        p.setBrush(QBrush(QColor("white")))
+        p.setPen(QPen(QColor("#4f9bff"), 2))
+        for pt in (a, b):
+            p.drawRect(QRectF(pt.x() - h, pt.y() - h, 2 * h, 2 * h))
 
     def _paint_timer_badge(self, p) -> None:
         path = self.path()
@@ -317,6 +332,96 @@ class EdgeItem(QGraphicsPathItem):
         p.drawRoundedRect(pill, 5, 5)
         p.setPen(QColor("#1b1b1b"))
         p.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
+
+    # ── endpoint dragging (reattach / move the arrow) ─────────────────────
+    def itemChange(self, change, value):
+        # Raise a selected edge above the nodes so its endpoint handles sit on
+        # top and stay grabbable even where they overlap a node's port.
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            self.setZValue(10 if value else -1)
+        return super().itemChange(change, value)
+
+    def _end_near(self, scene_pos):
+        a = self.src.port_scene(self.src_side)
+        b = self.dst.port_scene(self.dst_side)
+        if (scene_pos - a).manhattanLength() <= self.GRAB:
+            return "src"
+        if (scene_pos - b).manhattanLength() <= self.GRAB:
+            return "dst"
+        return None
+
+    def mousePressEvent(self, e):
+        end = self._end_near(e.scenePos())
+        if end is not None:
+            self._drag_end = end
+            self._preview = QGraphicsLineItem()
+            self._preview.setPen(QPen(QColor("#2a7fff"), 2, Qt.PenStyle.DashLine))
+            self.scene().addItem(self._preview)
+            self._update_preview(e.scenePos())
+            e.accept()
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_end is not None:
+            self._update_preview(e.scenePos())
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._drag_end is not None:
+            if self._preview is not None:
+                self.scene().removeItem(self._preview)
+                self._preview = None
+            node = next((it for it in self.scene().items(e.scenePos())
+                         if isinstance(it, NodeItem)), None)
+            self._reattach(self._drag_end, node, e.scenePos())
+            self._drag_end = None
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
+
+    def _update_preview(self, scene_pos) -> None:
+        anchor = (self.dst.port_scene(self.dst_side) if self._drag_end == "src"
+                  else self.src.port_scene(self.src_side))
+        self._preview.setLine(anchor.x(), anchor.y(),
+                              scene_pos.x(), scene_pos.y())
+
+    def _nearest_side(self, node, pt) -> str:
+        best, bd = "left", float("inf")
+        for s in self._NORMALS:
+            d = (node.port_scene(s) - pt).manhattanLength()
+            if d < bd:
+                bd, best = d, s
+        return best
+
+    def _reattach(self, end, node, drop_pos) -> None:
+        """Move the dragged endpoint onto ``node`` (re-picking the nearest
+        port). Rejected if it would make the arrow start and end on the same
+        node, or if dropped on empty canvas — the endpoint snaps back."""
+        if node is None:
+            self.update_path()
+            self.update()
+            return
+        other = self.dst if end == "src" else self.src
+        if node is other:
+            self.update_path()
+            self.update()
+            return
+        old = self.src if end == "src" else self.dst
+        if self in old.edges:
+            old.edges.remove(self)
+        side = self._nearest_side(node, drop_pos)
+        if end == "src":
+            self.src, self.src_side = node, side
+        else:
+            self.dst, self.dst_side = node, side
+        if self not in node.edges:
+            node.add_edge(self)
+        self.prepareGeometryChange()
+        self.update_path()
+        self.update()
 
     def mouseDoubleClickEvent(self, e):
         cb = getattr(self.scene(), "edge_double_clicked", None)
@@ -455,6 +560,7 @@ class MotionCanvas(QGraphicsView):
         self.setAcceptDrops(True)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setStyleSheet(f"background: {CANVAS_BG};")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # receive Delete key
         self._zoom = 1.0
 
     def dragEnterEvent(self, e):
@@ -478,6 +584,51 @@ class MotionCanvas(QGraphicsView):
         node.setPos(x - NodeItem.W / 2, y - NodeItem.H / 2)
         self.scene_.addItem(node)
         return node
+
+    # ── deletion (arrows + target blocks) ─────────────────────────────────
+    def remove_edge(self, edge) -> None:
+        for n in (edge.src, edge.dst):
+            if edge in n.edges:
+                n.edges.remove(edge)
+        if edge.scene() is self.scene_:
+            self.scene_.removeItem(edge)
+
+    def remove_node(self, node) -> None:
+        for edge in list(node.edges):      # drop every arrow touching the block
+            self.remove_edge(edge)
+        if node.scene() is self.scene_:
+            self.scene_.removeItem(node)
+
+    def delete_selected(self) -> None:
+        sel = list(self.scene_.selectedItems())
+        for it in sel:                     # edges first so node cleanup is simple
+            if isinstance(it, EdgeItem):
+                self.remove_edge(it)
+        for it in sel:
+            if isinstance(it, NodeItem):
+                self.remove_node(it)
+
+    def keyPressEvent(self, e):
+        if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.delete_selected()
+            e.accept()
+            return
+        super().keyPressEvent(e)
+
+    def contextMenuEvent(self, e):
+        target = next((it for it in self.items(e.pos())
+                       if isinstance(it, (NodeItem, EdgeItem))), None)
+        if target is None:
+            return
+        menu = QMenu(self)
+        label = "Delete arrow" if isinstance(target, EdgeItem) else "Delete target"
+        act = menu.addAction(label)
+        if menu.exec(e.globalPos()) is act:
+            if isinstance(target, EdgeItem):
+                self.remove_edge(target)
+            else:
+                self.remove_node(target)
+            e.accept()
 
     def _zoom_by(self, f: float) -> None:
         new = self._zoom * f
@@ -613,7 +764,6 @@ class MainWindow(QMainWindow):
         self.jog_mode = "joint"     # 'joint' | 'cartesian'
         self.jog_group = 0          # 0 -> joints 1-3, 1 -> joints 4-6
         self._dial7_pending: float | None = None  # joint-7 dial target to flush
-        self._target_seq = 0        # running counter for default posN names
         self._tasks: list[dict] = []   # saved Motion tasks (in-memory only)
         self._task_seq = 0          # running counter for default task names
         self._editing_task: int | None = None  # index being edited (None = new)
@@ -808,6 +958,12 @@ class MainWindow(QMainWindow):
             self._fade_in(self.mode_stack.currentWidget())
             if _MODES[view][0] == "Motion":
                 self._refresh_motion_palette()
+                # Default to the saved-task list when tasks already exist;
+                # otherwise drop straight into a blank editor.
+                if self._tasks:
+                    self._show_task_list()
+                else:
+                    self._show_motion_editor()
         self.back_btn.setEnabled(self._hist_idx > 0)
         self.fwd_btn.setEnabled(self._hist_idx < len(self._history) - 1)
 
@@ -1046,9 +1202,17 @@ class MainWindow(QMainWindow):
         self._update_jog_ui()
         return w
 
+    def _next_target_name(self) -> str:
+        """Lowest free ``posN`` name — so after deleting pos1..pos3 the next
+        save is pos1 again, not pos4."""
+        used = {name for name, _ in self._iter_targets()}
+        n = 1
+        while f"pos{n}" in used:
+            n += 1
+        return f"pos{n}"
+
     def _save_target(self) -> None:
-        self._target_seq += 1
-        name = f"pos{self._target_seq}"   # default name; rename via the pencil
+        name = self._next_target_name()   # default name; rename via the pencil
         joints = list(self.node.get_joints())
         xyz = self.node.get_ee_xyz()      # may be None if no /ee_pose yet
         self._add_target_row(name, {"joints": joints, "xyz": xyz})
@@ -1106,7 +1270,7 @@ class MainWindow(QMainWindow):
 
     # ── persistence (targets + tasks) ─────────────────────────────────────
     def _persist(self) -> None:
-        """Write saved targets, Motion tasks and the name counters to disk.
+        """Write saved targets, Motion tasks and the task-name counter to disk.
         A no-op while state is being restored (``self._loading``)."""
         if self._loading:
             return
@@ -1116,7 +1280,6 @@ class MainWindow(QMainWindow):
         store.save_state({
             "targets": targets,
             "tasks": self._tasks,
-            "target_seq": self._target_seq,
             "task_seq": self._task_seq,
         })
 
@@ -1137,7 +1300,6 @@ class MainWindow(QMainWindow):
             tasks = state.get("tasks")
             if isinstance(tasks, list):
                 self._tasks = tasks
-            self._target_seq = int(state.get("target_seq", self._target_seq))
             self._task_seq = int(state.get("task_seq", self._task_seq))
         finally:
             self._loading = False
@@ -1215,6 +1377,13 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         bar = QHBoxLayout()
+        # Black-outlined, faint-grey buttons so each reads as pressable.
+        task_btn_qss = (
+            "QPushButton { border: 1px solid #000000; border-radius: 4px;"
+            " background: #e6e6e6; color: #1b1b1b; padding: 5px 14px; }"
+            "QPushButton:hover { background: #f2f2f2; }"
+            "QPushButton:pressed { background: #d0d0d0; }"
+        )
         for label, slot in (
             ("Create new Task", self._task_create_new),
             ("Edit", self._task_edit_selected),
@@ -1223,6 +1392,7 @@ class MainWindow(QMainWindow):
             ("Delete", self._task_delete_selected),
         ):
             b = QPushButton(label)
+            b.setStyleSheet(task_btn_qss)
             b.clicked.connect(slot)
             bar.addWidget(b)
             if label == "Run":
@@ -1550,12 +1720,18 @@ class MainWindow(QMainWindow):
         self._arrow_delay_spin.setEnabled(kind == "timer")
         edge = getattr(self, "_motion_edge", None)
         if edge is not None:
-            edge.set_kind(kind)
+            try:
+                edge.set_kind(kind)
+            except RuntimeError:        # edge was deleted from the canvas
+                self._motion_edge = None
 
     def _on_arrow_delay_changed(self, val: float) -> None:
         edge = getattr(self, "_motion_edge", None)
         if edge is not None:
-            edge.set_delay(val)
+            try:
+                edge.set_delay(val)
+            except RuntimeError:        # edge was deleted from the canvas
+                self._motion_edge = None
 
     def _refresh_motion_palette(self) -> None:
         lay = self.motion_palette_layout

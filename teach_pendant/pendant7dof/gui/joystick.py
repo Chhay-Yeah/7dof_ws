@@ -187,4 +187,6 @@ class Joystick(QWidget):
 
     def _tick(self):
         if self.on_jog is not None:
-            self.on_jog(self.x, self.y, self.twist)
+            # Negate twist so a clockwise turn drives the positive direction;
+            # the grip still rotates with the finger (paint uses self.twist).
+            self.on_jog(self.x, self.y, -self.twist)
