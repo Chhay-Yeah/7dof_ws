@@ -55,7 +55,6 @@ _MODES = [
     ("Settings", "Backend & options"),
 ]
 _COMING_SOON = [
-    ("Teach", "Record waypoints"),
     ("Calibration", "Tool & base setup"),
     ("Vision", "Camera & detection"),
 ]
@@ -77,6 +76,14 @@ _HEADER_QSS = "background: #1b1b1b;"
 _LAUNCHER_QSS = "background: #202225;"
 # Fat, rounded buttons everywhere in the content area.
 _CONTENT_QSS = "QPushButton { min-height: 42px; padding: 8px 18px; border-radius: 7px; font-size: 14px; }"
+# Solid gray "real button" look — used for the Drawing-page action buttons so
+# they read as raised buttons rather than flat text.
+_DRAW_BTN_QSS = (
+    "QPushButton { background: #3a3f47; border: 1px solid #6a7280;"
+    " border-radius: 7px; color: white; padding: 8px 18px; }"
+    "QPushButton:hover { background: #454b54; border-color: #8a93a0; }"
+    "QPushButton:pressed { background: #2e333a; }"
+)
 
 
 class ModeCard(QFrame):
@@ -124,6 +131,20 @@ class ModeCard(QFrame):
         if self._enabled and self.rect().contains(e.pos()):
             self._on_click()
         super().mouseReleaseEvent(e)
+
+
+class ToggleListWidget(QListWidget):
+    """QListWidget where clicking the already-selected row deselects it, so a
+    target can be un-picked without selecting another one."""
+
+    def mousePressEvent(self, e):
+        item = self.itemAt(e.pos())
+        if item is not None and item.isSelected():
+            # Re-click on the current selection clears it.
+            self.clearSelection()
+            self.setCurrentItem(None)
+            return
+        super().mousePressEvent(e)
 
 
 class TargetRow(QWidget):
@@ -723,7 +744,7 @@ class TaskCard(QFrame):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
         self._title = QLabel(name)
-        self._title.setStyleSheet("font-weight: bold; font-size: 14px; background: transparent; border: none;")
+        self._title.setStyleSheet("color: #fff; font-weight: bold; font-size: 14px; background: transparent; border: none;")
         self._title.setWordWrap(True)
         lay.addWidget(self._title)
         sub = QLabel(subtitle)
@@ -1198,7 +1219,7 @@ class MainWindow(QMainWindow):
         self.target_search.setClearButtonEnabled(True)
         self.target_search.textChanged.connect(self._apply_target_filter)
         tv.addWidget(self.target_search)
-        self.targets_list = QListWidget()
+        self.targets_list = ToggleListWidget()
         tv.addWidget(self.targets_list, 1)
         brow = QHBoxLayout()
         save_btn = QPushButton("Save current")
@@ -1847,6 +1868,7 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("Z-paper offset (mm)"), 3, 0)
         form.addWidget(self.zpaper_spin, 3, 1)
         apply_btn = QPushButton("Apply")
+        apply_btn.setStyleSheet(_DRAW_BTN_QSS)
         apply_btn.clicked.connect(self._apply_draw_cfg)
         form.addWidget(apply_btn, 4, 0, 1, 2)
         col.addWidget(cfg_box)
@@ -1867,6 +1889,7 @@ class MainWindow(QMainWindow):
             ("Home", lambda: self.node.goto_preset("Home")),
         )):
             b = QPushButton(label)
+            b.setStyleSheet(_DRAW_BTN_QSS)
             b.clicked.connect(cb)
             actions.addWidget(b, i // 2, i % 2)
         col.addLayout(actions)
