@@ -1,0 +1,6 @@
+# Generated workspace artifacts — regenerate with workspace_mdh.py
+*.png
+*.pdf
+*.csv
+*.npy
+__pycache__/
