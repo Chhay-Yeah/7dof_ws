@@ -66,6 +66,18 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Value: false
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: EE Markers
+      Namespaces:
+        ee_markers: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /ee_markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48

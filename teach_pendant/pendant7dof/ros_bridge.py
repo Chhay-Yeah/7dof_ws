@@ -10,6 +10,7 @@ freezes the arm and stops feeding any motion targets.
 from __future__ import annotations
 
 import json
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -83,6 +84,10 @@ class PendantBridge(Node):
         # if it falls behind (workspace edge / unreachable) the target re-anchors
         # to the actual pose so the joystick can't push it out of reach.
         self._cart_target: list[float] | None = None
+        self._prev_cur: list[float] | None = None   # EE pos at the last jog tick
+        self._cart_stall = 0                         # consecutive stalled ticks
+        self._cart_stalled = False                   # latched: held at a limit
+        self._stall_dir: list[float] | None = None   # jog dir when it stalled
 
         # --- subscriptions ------------------------------------------------
         self.create_subscription(JointState, "/joint_states", self._cb_state, 20)
@@ -252,19 +257,25 @@ class PendantBridge(Node):
         target.pose = p
         self.target_pub.publish(target)
 
-    # The commanded target may lead the actual EE by at most this much (m).
-    # The joystick integrates into an internal target, but it's clamped to
-    # stay within CART_LEAD_M of where the robot actually is. Since the actual
-    # pose is by definition reachable, the target can never be driven more than
-    # CART_LEAD_M outside the workspace — so the IK no longer saturates and the
-    # arm stops wobbling/twitching at the edges. The robot also can't be
-    # "outrun": once it stalls at an edge the target clamps and holds.
+    # The commanded target leads the actual EE by at most CART_LEAD_M (m) so the
+    # IK has enough error to drive motion. That lead is a "carrot": at the
+    # reach/orientation boundary the robot can't catch it, the IK never gets
+    # under tolerance, so it stays active and chatters (joints oscillate, Home/
+    # E-stop get overridden). STALL_* detects that the EE has stopped advancing
+    # and re-anchors the target to the actual (reachable) pose, so the IK settles
+    # instead of chasing a point the robot can't reach. The GUI can't compute
+    # reachability directly, so it infers it from "did the EE actually move?".
     CART_LEAD_M = 0.01
+    STALL_FRAC = 0.25       # progress < this × commanded step ⇒ a stalled tick
+    STALL_TICKS = 4         # consecutive stalled ticks ⇒ latch (held at limit)
+    UNSTALL_DOT = 0.5       # steer >60° off the stalled dir ⇒ release the latch
 
     def cartesian_jog_xyz(self, dx: float, dy: float, dz: float) -> None:
         """Stream an EE target from the joystick (~15 Hz), integrating stick
-        deflection into an internal target that is lead-clamped to the actual
-        pose so it can't run past the reachable workspace."""
+        deflection into an internal target that leads the actual pose — but
+        latched to the actual pose when the robot stalls at a reach limit so it
+        can't be pushed past the reachable workspace (which would make the IK
+        chatter and override Home/E-stop)."""
         if self._estopped or self._ee_pose is None:
             return
         if dx == 0.0 and dy == 0.0 and dz == 0.0:
@@ -273,12 +284,48 @@ class PendantBridge(Node):
         cur = [p.x, p.y, p.z]
         if self._cart_target is None:
             self._cart_target = list(cur)
+
+        step = math.sqrt(dx * dx + dy * dy + dz * dz)
+        moved = (math.dist(cur, self._prev_cur)
+                 if self._prev_cur is not None else step)
+        self._prev_cur = list(cur)
+        d_unit = [dx / step, dy / step, dz / step]
+
+        # While latched at a limit, hold the target at the actual (reachable)
+        # pose so the IK settles and Home/E-stop work. Release only when the EE
+        # actually moves again or the user steers well off the stalled direction
+        # (so jogging back into free space resumes immediately).
+        if self._cart_stalled:
+            dot = sum(d_unit[i] * self._stall_dir[i] for i in range(3))
+            if moved >= self.STALL_FRAC * step or dot < self.UNSTALL_DOT:
+                self._cart_stalled = False
+                self._cart_stall = 0
+            else:
+                self._cart_target = list(cur)
+                self._publish_ee_target(*cur)
+                return
+
+        # Build the leading target, clamped to within CART_LEAD_M of the actual.
         t = [self._cart_target[0] + dx,
              self._cart_target[1] + dy,
              self._cart_target[2] + dz]
         lead = self.CART_LEAD_M
         for i in range(3):
             t[i] = min(cur[i] + lead, max(cur[i] - lead, t[i]))
+
+        # Stall detection: an outstanding lead the EE isn't closing ⇒ at a limit.
+        gap = math.dist(cur, t)
+        if gap > 0.5 * lead and moved < self.STALL_FRAC * step:
+            self._cart_stall += 1
+        else:
+            self._cart_stall = 0
+        if self._cart_stall >= self.STALL_TICKS:
+            self._cart_stalled = True
+            self._stall_dir = d_unit
+            self._cart_target = list(cur)
+            self._publish_ee_target(*cur)
+            return
+
         self._cart_target = t
         self._publish_ee_target(*t)
 
@@ -292,6 +339,9 @@ class PendantBridge(Node):
             self.get_logger().warn("no /ee_pose yet — is the FK node running?")
             return
         self._cart_target = [x, y, z]  # keep jog continuous from the set point
+        self._prev_cur = None
+        self._cart_stall = 0
+        self._cart_stalled = False
         self._publish_ee_target(x, y, z)
         self.get_logger().info(f"SET ee -> ({x:+.3f}, {y:+.3f}, {z:+.3f}) m")
 
@@ -324,6 +374,9 @@ class PendantBridge(Node):
     def estop(self) -> None:
         self._estopped = True
         self._cart_target = None  # forget any in-flight jog target
+        self._prev_cur = None
+        self._cart_stall = 0
+        self._cart_stalled = False
         self.freeze()
         self.get_logger().error("E-STOP engaged — arm frozen, commands blocked")
 

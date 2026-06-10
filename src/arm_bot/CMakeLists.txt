@@ -100,6 +100,16 @@ install(PROGRAMS
 )
 
 install(PROGRAMS
+  ${PROJECT_NAME}/ee_target_marker.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  ${PROJECT_NAME}/go_to_start.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
   ${PROJECT_NAME}/ik_to_trajectory.py
   DESTINATION lib/${PROJECT_NAME}
 )

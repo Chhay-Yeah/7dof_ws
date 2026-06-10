@@ -21,6 +21,7 @@ Per drawing message:
 """
 import json
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -474,6 +475,7 @@ class DrawingBatchPlanner(Node):
         self.q_draw     = _R_to_quat_wxyz(R_begin)
         self.q_approach = self.q_draw.copy()
 
+        t_plan_start = time.perf_counter()  # Table 4.1 timing
         cart_wps = self._build_cartesian_waypoints(data)
         if not cart_wps:
             self.get_logger().warn('Planner produced no Cartesian waypoints')
@@ -570,6 +572,7 @@ class DrawingBatchPlanner(Node):
         n_unconverged = 0
         max_resid = 0.0
         first_resid = None
+        ik_time_total = 0.0  # Table 4.1 timing — accumulated solve_ik wall time
 
         for idx, (x, y, z, q_wxyz, dt, _kind) in enumerate(cart_wps):
             # Treat (x, y, z) as paper-frame meters and transform to base
@@ -589,10 +592,12 @@ class DrawingBatchPlanner(Node):
             # then "stick" there because q_null_target tracked the bad
             # seed. Re-seeding kills that drift.
             ik_params_step = {**ik_params, 'q_null_target': q_begin}
+            _ik_t0 = time.perf_counter()
             q_sol, resid, conv = solve_ik(
                 self._chain, T_des, q_begin,
                 use_null_space=True, params=ik_params_step,
             )
+            ik_time_total += time.perf_counter() - _ik_t0
             point_kinds.append(_kind)
 
             if idx == 0:
@@ -653,6 +658,15 @@ class DrawingBatchPlanner(Node):
             f'→ JointTrajectory: {len(traj.points)} points, '
             f'duration={cum_t:.1f}s, first_residual={first_resid:.2e}, '
             f'max_residual={max_resid:.2e}, unconverged={n_unconverged}'
+        )
+        # Table 4.1 timing — read these off the console after a drawing run.
+        n_ik = len(cart_wps)
+        plan_ms = (time.perf_counter() - t_plan_start) * 1e3
+        self.get_logger().info(
+            f'[TIMING] batch generation {plan_ms:.1f} ms total; '
+            f'IK {n_ik} waypoints in {ik_time_total * 1e3:.1f} ms '
+            f'({ik_time_total / max(1, n_ik) * 1e3:.2f} ms/waypoint avg); '
+            f'controller dispatch @ 100 Hz (arm_robot_controllers.yaml update_rate)'
         )
 
     # ── Planning helpers ───────────────────────────────────────────────────

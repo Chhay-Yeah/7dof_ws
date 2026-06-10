@@ -1,4 +1,8 @@
-# Default initial positions for arm_bot's ros2_control fake system
+# Default initial positions for arm_bot's ros2_control fake system.
+# Left at all-zeros; the backend's go_to_start node commands a move to the
+# conditioned (elbow-up) start pose once the controller is up, instead of
+# pre-posing the spawn (more like real hardware: power on where you are, then
+# command a move). Zeros is an exact kinematic singularity, so don't jog from it.
 
 initial_positions:
   joint_1: 0

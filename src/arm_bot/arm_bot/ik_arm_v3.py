@@ -35,6 +35,8 @@ class IKNode(Node):
     TOL_POS      = 1e-5       # 10 µm
     TOL_ROT      = 1e-4       # ~0.006°
     NULL_K       = 0.3
+    NULL_FADE    = 0.02       # err-norm below which the null-space pull fades out
+    NULL_DAMP_ALPHA = 0.1     # low-pass rate of the posture the damping tracks
 
     def __init__(self):
         super().__init__("ik_7dof_v3")
@@ -78,10 +80,67 @@ class IKNode(Node):
         self._tol_pos = float(self.get_parameter("tol_pos").value)
         self._tol_rot = float(self.get_parameter("tol_rot").value)
 
+        # Singularity-robust damping. When manipulability w = sqrt(det(J W^-1 J^T))
+        # falls below w_thresh, raise the DLS damping toward lambda_sing so the
+        # arm eases into a singularity instead of the pseudo-inverse amplifying a
+        # tiny Cartesian error into a huge dq (the overshoot). w_thresh=0 disables
+        # it (default — keeps the FK/IK test launches unchanged; the pendant jog
+        # instance turns it on).
+        self.declare_parameter("w_thresh", 0.0)
+        self.declare_parameter("lambda_sing", self.LAMBDA_MAX)
+        self._w_thresh = float(self.get_parameter("w_thresh").value)
+        self._lambda_sing = float(self.get_parameter("lambda_sing").value)
+        # Per-tick joint-step cap [rad]; smaller = gentler jog / less overshoot.
+        self.declare_parameter("dq_max", self.DQ_MAX)
+        self._dq_max = float(self.get_parameter("dq_max").value)
+
+        # Null-space VELOCITY damping. A 7-DoF arm holding a 6-DoF pose has a
+        # redundant DoF (self-motion manifold): the EE stays put while the
+        # joints can slide, and with no damping the live loop turns that into a
+        # wobble. This term resists the self-motion by pulling toward a low-pass
+        # of the actual posture (q_ref) — so it damps oscillation but fades to
+        # zero at rest (q_ref -> q), unlike the fixed null_k pull which leaks and
+        # blocks convergence. 0 disables (default). Enable it for the live jog.
+        self.declare_parameter("null_damp_k", 0.0)
+        self.declare_parameter("null_damp_alpha", self.NULL_DAMP_ALPHA)
+        self._null_damp_k = float(self.get_parameter("null_damp_k").value)
+        self._null_damp_alpha = float(self.get_parameter("null_damp_alpha").value)
+
+        # Task-space gains. Lowering rot_gain reduces how hard the IK chases
+        # orientation — useful for jog, where a wrist with a tight joint can't
+        # hold orientation while the EE translates and otherwise limit-cycles.
+        self.declare_parameter("pos_gain", self.POS_GAIN)
+        self.declare_parameter("rot_gain", self.ROT_GAIN)
+        self._pos_gain = float(self.get_parameter("pos_gain").value)
+        self._rot_gain = float(self.get_parameter("rot_gain").value)
+
+        # Position-only mode: track EE position only (3-DoF task), leaving
+        # orientation free for the null-space to resolve. For a redundant arm
+        # whose wrist can't hold orientation while translating, this removes the
+        # orientation fight entirely — clean XYZ tracking, no wrist wobble. The
+        # tool orientation drifts smoothly as a consequence. Default False.
+        self.declare_parameter("position_only", False)
+        self._position_only = bool(self.get_parameter("position_only").value)
+
+        # Soft joint limits: tighter than the URDF limits, used to filter out
+        # unwanted IK branches (e.g. pin joint_4 to one sign so the arm stays
+        # elbow-UP and can't flip elbow-up/down — the flip passes through the
+        # straight-arm singularity and causes wobble). Intersected with the URDF
+        # limits in _cb_urdf. Sentinel [0.0] (len<=1) => use URDF limits as-is.
+        self.declare_parameter("soft_q_min", [0.0])
+        self.declare_parameter("soft_q_max", [0.0])
+        smn = list(self.get_parameter("soft_q_min").value)
+        smx = list(self.get_parameter("soft_q_max").value)
+        self._soft_min = np.array(smn, dtype=float) if len(smn) > 1 else None
+        self._soft_max = np.array(smx, dtype=float) if len(smx) > 1 else None
+        self._q_lo = None   # effective (URDF ∩ soft) limits, set in _cb_urdf
+        self._q_hi = None
+
         self._chain: UrdfChain | None = None
         self._joint_index = None
 
         self._q      = None
+        self._q_ref  = None        # low-pass posture for null-space damping
         self._names_in = None
         self._T_des  = None
         self._active = False
@@ -126,6 +185,19 @@ class IKNode(Node):
             self._joint_weights = None
         self._W_inv = (np.diag(1.0 / self._joint_weights)
                        if self._joint_weights is not None else np.eye(self._chain.n))
+
+        # Effective joint limits = URDF limits ∩ soft limits (when sized right).
+        self._q_lo = np.array(self._chain.q_min, dtype=float).copy()
+        self._q_hi = np.array(self._chain.q_max, dtype=float).copy()
+        if self._soft_min is not None and self._soft_min.shape[0] == self._chain.n:
+            self._q_lo = np.maximum(self._q_lo, self._soft_min)
+        if self._soft_max is not None and self._soft_max.shape[0] == self._chain.n:
+            self._q_hi = np.minimum(self._q_hi, self._soft_max)
+        if (self._soft_min is not None or self._soft_max is not None):
+            self.get_logger().info(
+                f"soft limits active: q_lo={np.round(self._q_lo, 2)} "
+                f"q_hi={np.round(self._q_hi, 2)}")
+
         tgt = "begin/custom" if self._null_target is not None else "q_mid"
         self.get_logger().info(
             f"null-space: target={tgt}, NULL_K={self._null_k}, "
@@ -162,21 +234,39 @@ class IKNode(Node):
 
         n = self._chain.n
         I6 = np.eye(6)
+        I3 = np.eye(3)
         In = np.eye(n)
 
         q_null = (self._null_target if self._null_target is not None
                   else self._chain.q_mid)
 
+        # Track a low-pass of the actual posture (updated from the measured _q,
+        # before the inner loop mutates it). The null-space damping below pulls
+        # toward this lagged posture, so it opposes fast self-motion (wobble)
+        # but vanishes once the arm settles (q_ref converges to q).
+        if self._q_ref is None:
+            self._q_ref = self._q.copy()
+        else:
+            self._q_ref += self._null_damp_alpha * (self._q - self._q_ref)
+
         for _ in range(self._inner_iters):
             J, T_cur = self._chain.jacobian(self._q)
             p_ee = T_cur[:3, 3]
 
-            e_p = self.POS_GAIN * (self._T_des[:3, 3] - p_ee)
-            e_r = self.ROT_GAIN * rot_error(T_cur[:3, :3], self._T_des[:3, :3])
-
-            err_norm = np.sqrt(np.linalg.norm(e_p)**2 + np.linalg.norm(e_r)**2)
-            if (np.linalg.norm(e_p) < self._tol_pos and
-                np.linalg.norm(e_r) < self._tol_rot):
+            e_p = self._pos_gain * (self._T_des[:3, 3] - p_ee)
+            if self._position_only:
+                # 3-DoF task: track position only; orientation left free for the
+                # null-space (no wrist fight → no orientation-induced wobble).
+                J_task, e_task, I_task = J[:3, :], e_p, I3
+                err_norm = np.linalg.norm(e_p)
+                converged = err_norm < self._tol_pos
+            else:
+                e_r = self._rot_gain * rot_error(T_cur[:3, :3], self._T_des[:3, :3])
+                J_task, e_task, I_task = J, np.r_[e_p, e_r], I6
+                err_norm = np.sqrt(np.linalg.norm(e_p)**2 + np.linalg.norm(e_r)**2)
+                converged = (np.linalg.norm(e_p) < self._tol_pos and
+                             np.linalg.norm(e_r) < self._tol_rot)
+            if converged:
                 self._active = False
                 break
 
@@ -185,17 +275,48 @@ class IKNode(Node):
 
             # Weighted damped least-squares: high-weight joints move less.
             W_inv = self._W_inv
-            M  = J @ W_inv @ J.T + (lam ** 2) * I6
-            dq = W_inv @ J.T @ np.linalg.solve(M, np.r_[e_p, e_r])
+            JWJ = J_task @ W_inv @ J_task.T
 
-            Jp  = W_inv @ J.T @ np.linalg.solve(M, J)
-            dq += (In - Jp) @ (self._null_k * (q_null - self._q))
+            # Singularity-robust floor: raise the damping as manipulability
+            # drops so the arm slows smoothly into a singularity instead of the
+            # pseudo-inverse amplifying a tiny Cartesian error into a large dq
+            # (the overshoot). Disabled when w_thresh == 0.
+            if self._w_thresh > 0.0:
+                w = np.sqrt(max(np.linalg.det(JWJ), 0.0))
+                engaged = w < self._w_thresh
+                if engaged:
+                    ratio = 1.0 - w / self._w_thresh
+                    lam = max(lam, self._lambda_sing * ratio * ratio)
+                # Log w on every active tick (throttled) so w_thresh can be
+                # calibrated: watch typical w while jogging, set w_thresh just
+                # above the w where overshoot starts.
+                self.get_logger().info(
+                    f"manip w={w:.4f} (thresh {self._w_thresh})"
+                    + (f"  -> DAMP λ={lam:.4f}" if engaged else ""),
+                    throttle_duration_sec=0.5)
+
+            M  = JWJ + (lam ** 2) * I_task
+            dq = W_inv @ J_task.T @ np.linalg.solve(M, e_task)
+
+            # Null-space (redundancy) resolution, faded out near the target so
+            # its leak through the damped projector can't hold a steady
+            # following error that stops the node deactivating (the reason jog
+            # used to run null_k=0). Full pull while moving, ~0 once converged.
+            Jp  = W_inv @ J_task.T @ np.linalg.solve(M, J_task)
+            N   = In - Jp                       # (damped) null-space projector
+            null_gain = self._null_k * min(1.0, err_norm / self.NULL_FADE)
+            dq += N @ (null_gain * (q_null - self._q))
+            # Null-space velocity damping: resist self-motion (wobble) of the
+            # redundant DoF by pulling toward the lagged posture; self-fading so
+            # it doesn't block convergence/deactivation.
+            if self._null_damp_k > 0.0:
+                dq += N @ (self._null_damp_k * (self._q_ref - self._q))
 
             mag = np.linalg.norm(dq)
-            if mag > self.DQ_MAX:
-                dq *= (self.DQ_MAX / mag)
+            if mag > self._dq_max:
+                dq *= (self._dq_max / mag)
 
-            self._q = np.clip(self._q + dq, self._chain.q_min, self._chain.q_max)
+            self._q = np.clip(self._q + dq, self._q_lo, self._q_hi)
 
         cmd              = JointState()
         cmd.header.stamp = self.get_clock().now().to_msg()
