@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>arm_bot_hw</name>
+  <version>0.0.0</version>
+  <description>
+    Damiao CAN-FD motor driver for the 7-DOF arm. Self-contained copy of
+    tanerb_canfd_sub from damiao_ws so this workspace can be tested
+    end-to-end without sourcing a sibling workspace.
+  </description>
+  <maintainer email="noreply@example.com">piranut</maintainer>
+  <license>TODO</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <!-- pyusb: the native usb_class.so imports `usb` at load. Install via
+       `pip install pyusb` (and the libusb-1.0 system lib) if rosdep can't. -->
+  <exec_depend>python3-usb</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
