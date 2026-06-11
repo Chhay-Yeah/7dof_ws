@@ -151,15 +151,16 @@ def generate_launch_description():
                      "w_thresh": ParameterValue(jog_w_thresh, value_type=float),
                      "lambda_sing": ParameterValue(jog_lambda_sing, value_type=float),
                      "dq_max": ParameterValue(jog_dq_max, value_type=float),
-                     # Soft limits filter unwanted IK branches. joint_4 pinned
-                     # POSITIVE keeps the arm ELBOW-UP (the well-conditioned
-                     # region drawing uses; cond ~18 vs ~34 down) and stops the
-                     # elbow-up/down flip through the straight-arm singularity.
-                     # joint_5/_7 tightened from the URDF continuous/±1.6 range;
-                     # joint_6 already narrow. j1/j2/j3 left at URDF.
+                     # Soft limits filter unwanted IK branches. DEFAULT is now
+                     # the FULL URDF range (max reach). To restore the old
+                     # wobble-safe behaviour, pin joint_4 POSITIVE by setting its
+                     # soft_q_min entry back to 0.05 (keeps the arm ELBOW-UP and
+                     # stops the elbow-up/down flip through the straight-arm
+                     # singularity) — the trade-off is much less reach. j6 stays
+                     # narrow (hardware). j1/j3 continuous -> sampled +-pi.
                      #            j1     j2    j3    j4     j5     j6     j7
-                     "soft_q_min": [-3.14, -1.6, -3.14, 0.05, -1.5, -0.48, -1.5],
-                     "soft_q_max": [ 3.14,  1.6,  3.14, 1.6,   1.5,  0.26,  1.5]}],
+                     "soft_q_min": [-3.14, -1.6, -3.14, -1.6, -1.6, -0.48, -1.6],
+                     "soft_q_max": [ 3.14,  1.6,  3.14,  1.6,  1.6,  0.26,  1.6]}],
     )
     fk_node = Node(
         package="arm_bot", executable="fk_arm_v3.py", name="fk_7dof_v3",

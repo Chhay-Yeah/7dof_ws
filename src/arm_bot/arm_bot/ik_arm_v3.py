@@ -226,6 +226,15 @@ class IKNode(Node):
                      msg.pose.position.y,
                      msg.pose.position.z]
         self._T_des  = T
+        if not self._active:
+            # Fresh (re)activation after the node was idle: re-seed the
+            # null-space damping reference to the CURRENT posture. Otherwise a
+            # joint that was moved by hand while the IK was idle (e.g. joint_7
+            # jogged to escape a stall) gets yanked back toward the stale
+            # pre-idle posture the instant Cartesian jog resumes. During
+            # continuous jogging _active stays True, so q_ref keeps low-passing
+            # and its wobble-damping is unaffected.
+            self._q_ref = None
         self._active = True
 
     def _step(self):
