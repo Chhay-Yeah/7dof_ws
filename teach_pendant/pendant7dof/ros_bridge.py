@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import glob
+import signal
+import subprocess
 
 import rclpy
 from rclpy.node import Node
@@ -25,7 +29,12 @@ JOINT_NAMES = [
     "joint_1", "joint_2", "joint_3", "joint_4",
     "joint_5", "joint_6", "joint_7",
 ]
-HOME_JOINTS = [0.0] * 7
+# "Home" button = all joints at zero (per user request). NB this is the
+# straight-out, near-singular pose, so jogging/drawing FROM it can be poorly
+# conditioned — it's a parking/reset target, not the operating pose. (The
+# backend still BOOTS to the conditioned elbow-up go_to_start pose
+# [0,-0.4,0,1.2,0,0,0] in pendant_backend.launch.py; that is separate.)
+HOME_JOINTS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 JOG_STEP_RAD = 0.1
 JOG_DURATION_S = 0.5
 
@@ -41,6 +50,15 @@ JOINT_LIMITS = [
     (-0.48, 0.26),   # joint_6 — narrow range
     (-1.6, 1.6),     # joint_7
 ]
+
+# Nodes that DRIVE the arm — killed by the hard E-stop so the robot has no
+# command source left (then re-run on RESET). These are the command-side
+# drivers (their node names from pendant_backend.launch.py); the E-stop ALSO
+# kills whatever publishes /joint_states (discovered live), to cover the real
+# hardware where pos_motor_sub follows /joint_states. In sim the /joint_states
+# publisher is Gazebo's broadcaster (no separate process → simply not found →
+# skipped), and killing these command drivers is what stops the sim robot.
+DRIVER_NODES = ("ik_7dof_v3", "ik_to_trajectory", "drawing_batch_planner")
 
 # Named joint presets shown as buttons in the GUI.
 PRESETS: dict[str, list[float]] = {
@@ -116,6 +134,7 @@ class PendantBridge(Node):
         self._last_q = list(HOME_JOINTS)
         self._ee_pose: PoseStamped | None = None
         self._estopped = False
+        self._killed_procs: list = []   # (argv, cwd) of nodes killed by E-stop, for RESET
         self._last_drawing: str | None = None
         # Internal Cartesian-jog target. Advances only while the robot keeps up;
         # if it falls behind (workspace edge / unreachable) the target re-anchors
@@ -242,6 +261,14 @@ class PendantBridge(Node):
     def send_home(self) -> None:
         self.goto_preset("Home")
 
+    def stop_and_home(self) -> None:
+        """Drawing-tab 'Reset': stop whatever the robot is doing (cancel the
+        active drawing/jog so nothing keeps streaming the controller) and then
+        move it Home. Blocked while E-stopped (goto_preset guards that)."""
+        self._cart_jog_stop(force=True)   # stop the jog/draw IK from fighting
+        self._clear_path()
+        self.goto_preset("Home")
+
     def move_to_joints(self, positions, duration_s: float = 2.0) -> None:
         """Move to an arbitrary 7-joint configuration (used to recall a saved
         target)."""
@@ -316,6 +343,13 @@ class PendantBridge(Node):
         if self._estopped or self._ee_pose is None:
             return
         if dx == 0.0 and dy == 0.0 and dz == 0.0:
+            # Stick centered / released: stop leading the target and re-anchor it
+            # to the actual pose so the live jog IK reaches it and DEACTIVATES.
+            # Otherwise the last ~1 cm lead (or an unreachable lead at a reach
+            # limit) keeps ik_arm_v3 perpetually active, streaming /joint_commands
+            # -> ik_to_trajectory -> /arm_controller/joint_trajectory at ~50 Hz,
+            # which then preempts any drawing trajectory ~50x/s (the twitch).
+            self._cart_jog_stop()
             return
         p = self._ee_pose.pose.position
         cur = [p.x, p.y, p.z]
@@ -383,6 +417,26 @@ class PendantBridge(Node):
         self._cart_target = t
         self._publish_ee_target(*t)
 
+    def _cart_jog_stop(self, force: bool = False) -> None:
+        """Re-anchor the Cartesian-jog target to the current actual pose so the
+        live jog IK (ik_arm_v3) reaches it immediately and goes idle. Called when
+        the joystick is released/centered and before a drawing is dispatched, so
+        the jog IK can never keep streaming /joint_commands over another motion.
+        Safe / cheap to call repeatedly. With force=True it always re-anchors
+        (used before drawing / on freeze) — a hard guarantee the jog IK is idle
+        even if the bridge thinks no jog is in progress; with force=False it is a
+        no-op when no jog is active (the joystick-release path)."""
+        if not force and self._cart_target is None and not self._cart_stalled:
+            return
+        if self._ee_pose is not None:
+            p = self._ee_pose.pose.position
+            self._publish_ee_target(p.x, p.y, p.z)
+        self._cart_target = None
+        self._prev_cur = None
+        self._cart_stall = 0
+        self._cart_stalled = False
+        self._jog_moved_once = False
+
     # ── workspace clamp ───────────────────────────────────────────────────────
     def _clamp_target(self, t: list[float], cur: list[float]):
         """Project a jog target into the reachable dome (shrunk by _WS_MARGIN_M),
@@ -439,6 +493,10 @@ class PendantBridge(Node):
         if self._estopped:
             self.get_logger().warn("E-stop active — drawing ignored")
             return
+        # Defensive: make sure the live Cartesian-jog IK is idle before the batch
+        # planner takes the controller, so a still-active jog can't preempt the
+        # drawing trajectory (see _cart_jog_stop). force=True = hard guarantee.
+        self._cart_jog_stop(force=True)
         msg = String()
         msg.data = json.dumps(strokes_dict)
         self.strokes_pub.publish(msg)
@@ -457,18 +515,109 @@ class PendantBridge(Node):
     # ── safety ────────────────────────────────────────────────────────────
     def freeze(self) -> None:
         """Preempt whatever the controller is doing and hold position."""
+        self._cart_jog_stop(force=True)   # stop the jog IK fighting the hold trajectory
         self._clear_path()
         self._send_traj(list(self._last_q), 0.1)
 
+    # ── hard E-stop: kill the nodes that drive the arm ─────────────────────
+    def _find_node_procs(self, node_names):
+        """Return [(pid, argv, cwd)] for OS processes whose ROS node name is in
+        ``node_names`` (matched by the ``__node:=NAME`` remap or the executable
+        basename). Excludes this GUI process. A node with no separate process —
+        e.g. a ros2_control controller living inside Gazebo — simply isn't
+        found, so it's skipped (we never kill Gazebo)."""
+        mypid = os.getpid()
+        out = []
+        for cmd_path in glob.glob('/proc/[0-9]*/cmdline'):
+            try:
+                pid = int(cmd_path.split('/')[2])
+                if pid == mypid:
+                    continue
+                with open(cmd_path, 'rb') as f:
+                    argv = [a.decode('utf-8', 'replace')
+                            for a in f.read().split(b'\x00') if a]
+            except (OSError, ValueError):
+                continue
+            if not argv:
+                continue
+            joined = ' '.join(argv)
+            bases = {a.rsplit('/', 1)[-1] for a in argv}
+            for nm in node_names:
+                if (f'__node:={nm}' in joined or nm in bases or f'{nm}.py' in bases):
+                    try:
+                        cwd = os.readlink(f'/proc/{pid}/cwd')
+                    except OSError:
+                        cwd = None
+                    out.append((pid, argv, cwd))
+                    break
+        return out
+
     def estop(self) -> None:
+        """HARD E-stop: kill every node driving the arm — the command drivers
+        (IK / ik_to_trajectory / drawing planner) AND whatever publishes
+        /joint_states — so the robot has nothing left to follow and simply
+        stops where it is (a soft 'hold' command is useless when the arm is
+        wobbling near a singularity and won't accept commands). The killed
+        processes' command lines are saved so RESET can re-run them."""
         self._estopped = True
-        self._cart_target = None  # forget any in-flight jog target
+        self._cart_target = None       # forget any in-flight jog target
         self._prev_cur = None
         self._cart_stall = 0
         self._cart_stalled = False
-        self.freeze()
-        self.get_logger().error("E-STOP engaged — arm frozen, commands blocked")
+
+        names = set(DRIVER_NODES)
+        try:
+            for info in self.get_publishers_info_by_topic('/joint_states'):
+                if info.node_name and info.node_name != self.get_name():
+                    names.add(info.node_name)
+        except Exception as e:
+            self.get_logger().warn(f"E-STOP: couldn't enumerate /joint_states publishers: {e}")
+
+        procs = self._find_node_procs(names)
+        self._killed_procs = [(argv, cwd) for (_p, argv, cwd) in procs]
+        killed = 0
+        for pid, argv, _cwd in procs:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+                self.get_logger().error(f"E-STOP killed pid {pid}: {argv[0].rsplit('/',1)[-1]} "
+                                        f"{argv[1].rsplit('/',1)[-1] if len(argv) > 1 else ''}")
+            except OSError as e:
+                self.get_logger().warn(f"E-STOP: couldn't kill pid {pid}: {e}")
+
+        # With the command flood now dead, a single hold trajectory STICKS
+        # (nothing left to preempt it). This preempts any long drawing
+        # trajectory still loaded in the controller so the arm freezes mid-
+        # stroke instead of finishing it. In sim this halts the JTC at the
+        # current pose; on hardware there's no JTC so it's a harmless no-op
+        # (killing the /joint_states publisher is what holds the motors there).
+        try:
+            self._clear_path()
+            self._send_traj(list(self._last_q), 0.1)
+        except Exception as e:
+            self.get_logger().warn(f"E-STOP: hold publish failed: {e}")
+
+        self.get_logger().error(
+            f"E-STOP engaged — killed {killed} driver node(s) + held current pose; "
+            f"arm has no command source. Commands blocked until RESET.")
 
     def estop_reset(self) -> None:
+        """RESET: re-run the nodes the E-stop killed, with this process's ROS
+        environment. The arm STAYS where it is — the restarted IK seeds from the
+        current /joint_states and won't move until commanded; nothing auto-homes."""
+        n = 0
+        for argv, cwd in getattr(self, '_killed_procs', []):
+            try:
+                subprocess.Popen(argv, cwd=cwd or None, env=os.environ.copy(),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                n += 1
+                self.get_logger().warn(f"RESET re-ran: {argv[0].rsplit('/',1)[-1]} "
+                                       f"{argv[1].rsplit('/',1)[-1] if len(argv) > 1 else ''}")
+            except OSError as e:
+                self.get_logger().error(f"RESET: couldn't re-run {argv}: {e}")
+        self._killed_procs = []
         self._estopped = False
-        self.get_logger().warn("E-stop cleared")
+        self.get_logger().warn(
+            f"E-stop cleared — re-ran {n} node(s); arm holds its current pose "
+            f"(press Home to move it).")
