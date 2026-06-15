@@ -203,14 +203,47 @@ def generate_launch_description():
         name="drawing_batch_planner", output="screen",
         parameters=[{
             "use_sim_time": sim_time,
+            # Reverted to the lower, more-dexterous draw pose. A raised pose
+            # ([0,-0.53,0,1.368,0,0,1.24], pen plane ~95 mm up) reaches near a
+            # kinematic boundary where the arm FLIPS configuration mid-stroke
+            # (up to ~0.8 rad joint jump on diagonals) → the pen swings off the
+            # path ("all over the place"). This lower pose draws far-and-low,
+            # which is flip-free (jumps ≤0.26 rad).
             "begin_draw_joints": [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0],
             "pen_offset_mm": 100.0,
             "pen_axis_local": [1.0, 0.0, 0.0],
-            "move_to_begin_seconds": 4.0,
+            # Gentle approach to the drawing: ease the move into the begin pose
+            # and (especially) the pen descent onto the paper. approach_seconds
+            # is the time to lower the pen the full lift height — the default
+            # 1.0 s (~50 mm/s) stabs down too fast; 3.0 s (~17 mm/s) is a calm
+            # touch-down (also slows the post-stroke lift, which reuses it).
+            "move_to_begin_seconds": 6.0,
+            "approach_seconds": 3.0,
             "dwell_seconds": 3.0,
-            "workspace_x_mm": 40.0,
-            "workspace_y_mm": 40.0,
-            "lift_mm": 0.0,
+            # Tilt-capable drawing: pen-tip task-priority IK (perpendicular in
+            # the middle, tilts only near the edges). This expands the verified
+            # IK-reachable drawable area from a ~40 mm square to a 240×100 mm
+            # rectangle, re-centred into the reachable region by the anchor.
+            # See drawing_batch_planner / ik_lib.solve_ik_tip; numbers from the
+            # offline reach probe (100% reachable, ≤20° tilt, ≤1 mm pos error).
+            "draw_tilt": True,
+            # 100x100 mm SQUARE canvas, re-centred at (depth +15, width +20) mm
+            # via the anchor below. Chosen from a full 2-D reachability map of the
+            # pen-down drawable region (the band is ~100 mm deep × ~250 mm wide;
+            # 100 mm is the largest square the depth allows). Pen ⟂ in the middle,
+            # leaning ≤15° only toward the corners. The old 240×60 strip was a
+            # thin slice of the same band and mapped badly onto a squarish canvas
+            # widget (vertical drags fell in the dead letterbox margins).
+            # anchor_x = -(width centre), anchor_y = +(depth centre); convention
+            # verified against the old (-35,+5)=(width35,depth5) value.
+            "workspace_x_mm": 100.0,
+            "workspace_y_mm": 100.0,
+            "max_workspace_mm": 300.0,
+            "canvas_anchor_x_mm": 10.0,
+            "canvas_anchor_y_mm": 18.0,
+            "tilt_max_deg": 30.0,
+            # Pen-up lift baseline (the GUI shows this as 0 and trims around it).
+            "lift_mm": 50.0,
             "log_joint_deltas": True,
             "locked_joints": [-1],
             "null_k": 2.0,

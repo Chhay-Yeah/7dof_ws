@@ -30,11 +30,23 @@ from PyQt6.QtGui import (
 
 from .. import bootstrap, store
 from ..ros_bridge import PendantBridge, JOINT_NAMES
-from .drawing_canvas import CanvasView, DEFAULT_WORKSPACE_MM
+from .drawing_canvas import (
+    CanvasView, DEFAULT_WORKSPACE_X_MM, DEFAULT_WORKSPACE_Y_MM,
+)
 from .joystick import Joystick
 
-MAX_WORKSPACE_MM = 50.0
-DEFAULT_LIFT_MM = 0.0
+# Per-axis canvas caps. Default canvas is a 100×100 square (the largest square the
+# pen-down drawable band allows — it's ~100 mm deep × ~250 mm wide). X (width) can
+# be widened toward the band's width if a landscape area is wanted; Y (depth) is
+# the binding limit (~100 mm), capped just above it. Beyond these the planner
+# clamps/warns. (See pendant_backend canvas_anchor + drawing_batch_planner.)
+MAX_WORKSPACE_X_MM = 240.0
+MAX_WORKSPACE_Y_MM = 110.0
+# Pen lift: the value sent to the planner is the spinbox value PLUS this
+# baseline, and the spinbox default reads 0 — i.e. "0" on screen = a 50 mm
+# real pen-up lift. Lets the user trim around a safe baseline.
+LIFT_BASELINE_MM = 50.0
+DEFAULT_LIFT_MM = 50.0   # actual lift sent by default (shown as 0)
 DEFAULT_Z_PAPER_OFFSET_MM = 0.0
 
 # Per-tick jog scale at the joystick rate (full stick deflection).
@@ -783,9 +795,9 @@ class MainWindow(QMainWindow):
         self.resize(1100, 700)
 
         self._draw_cfg = {
-            "workspace_x_mm": DEFAULT_WORKSPACE_MM,
-            "workspace_y_mm": DEFAULT_WORKSPACE_MM,
-            "lift_mm": DEFAULT_LIFT_MM,
+            "workspace_x_mm": DEFAULT_WORKSPACE_X_MM,
+            "workspace_y_mm": DEFAULT_WORKSPACE_Y_MM,
+            "lift_mm": DEFAULT_LIFT_MM,          # actual lift (mm) sent to planner
             "z_paper_offset_mm": DEFAULT_Z_PAPER_OFFSET_MM,
         }
         self._history: list[int] = []
@@ -1810,8 +1822,12 @@ class MainWindow(QMainWindow):
         spd = self.jog_speed.value()
         if self.jog_mode == "cartesian":
             k = CART_STEP_PER_TICK * spd
+            # A zero tick (stick released/centered) re-anchors the jog IK so it
+            # goes idle instead of chasing the last leading target forever.
             self.node.cartesian_jog_xyz(x * k, y * k, twist * k)
         else:
+            if x == 0.0 and y == 0.0 and twist == 0.0:
+                return   # release in joint mode: nothing to command
             k = JOINT_STEP_PER_TICK * spd
             base = 0 if self.jog_group == 0 else 3
             self.node.jog_joints({base: x * k, base + 1: y * k, base + 2: twist * k})
@@ -1855,9 +1871,21 @@ class MainWindow(QMainWindow):
 
         cfg_box = QGroupBox("Drawing settings")
         form = QGridLayout(cfg_box)
-        self.ws_x_spin = self._mm_spin(10.0, MAX_WORKSPACE_MM, self._draw_cfg["workspace_x_mm"])
-        self.ws_y_spin = self._mm_spin(10.0, MAX_WORKSPACE_MM, self._draw_cfg["workspace_y_mm"])
-        self.lift_spin = self._mm_spin(0.0, 60.0, self._draw_cfg["lift_mm"])
+        self.ws_x_spin = self._mm_spin(20.0, MAX_WORKSPACE_X_MM, self._draw_cfg["workspace_x_mm"])
+        self.ws_y_spin = self._mm_spin(20.0, MAX_WORKSPACE_Y_MM, self._draw_cfg["workspace_y_mm"])
+        # Lift spin shows the value RELATIVE to the 50 mm baseline: 0 = 50 mm
+        # real lift. Stored cfg lift_mm is the actual value (display + baseline).
+        # Range is wide-open (the adjustment is uncapped): display down to the
+        # baseline (= 0 mm real lift) and far up; the planner clamps real lift
+        # to >= 0. NOTE: a large lift can pull the canvas corners out of reach
+        # at the pen-up height, so very high values may make travel/lift IK miss.
+        self.lift_spin = self._mm_spin(-LIFT_BASELINE_MM, 950.0,
+                                       self._draw_cfg["lift_mm"] - LIFT_BASELINE_MM)
+        self.lift_spin.setToolTip(f"0 = {LIFT_BASELINE_MM:.0f} mm baseline pen-up "
+                                  f"lift; negative lowers it (min 0 mm real), "
+                                  f"positive raises it. Adjustment is uncapped; "
+                                  f"very high lift can put canvas corners out of "
+                                  f"reach at the pen-up height.")
         self.zpaper_spin = self._mm_spin(0.0, 30.0, self._draw_cfg["z_paper_offset_mm"])
         form.addWidget(QLabel("Workspace X (mm)"), 0, 0)
         form.addWidget(self.ws_x_spin, 0, 1)
@@ -1874,8 +1902,8 @@ class MainWindow(QMainWindow):
         col.addWidget(cfg_box)
 
         warn = QLabel(
-            f"Workspace clamped to ~{int(MAX_WORKSPACE_MM)} mm; lift/offset ≥ 0. "
-            "Applying new settings sends the robot Home."
+            f"Workspace capped to {int(MAX_WORKSPACE_X_MM)}×{int(MAX_WORKSPACE_Y_MM)} mm "
+            "(IK-reachable drawable area). Applying new settings sends the robot Home."
         )
         warn.setWordWrap(True)
         warn.setStyleSheet("color: #a60; font-size: 11px;")
@@ -1885,7 +1913,7 @@ class MainWindow(QMainWindow):
         for i, (label, cb) in enumerate((
             ("Send", lambda: self.node.send_drawing(self._drawing_message())),
             ("Clear", self.canvas.clear),
-            ("Resume", self.node.resend_last_drawing),
+            ("Reset", self.node.stop_and_home),   # stop the robot, then move Home
             ("Home", lambda: self.node.goto_preset("Home")),
         )):
             b = QPushButton(label)
@@ -1910,7 +1938,7 @@ class MainWindow(QMainWindow):
     def _apply_draw_cfg(self) -> None:
         self._draw_cfg["workspace_x_mm"] = self.ws_x_spin.value()
         self._draw_cfg["workspace_y_mm"] = self.ws_y_spin.value()
-        self._draw_cfg["lift_mm"] = self.lift_spin.value()
+        self._draw_cfg["lift_mm"] = self.lift_spin.value() + LIFT_BASELINE_MM
         self._draw_cfg["z_paper_offset_mm"] = self.zpaper_spin.value()
         self.canvas.set_workspace(self._draw_cfg["workspace_x_mm"],
                                   self._draw_cfg["workspace_y_mm"])
@@ -1918,7 +1946,7 @@ class MainWindow(QMainWindow):
         self.node.goto_preset("Home")
 
     def _drawing_message(self) -> dict:
-        self._draw_cfg["lift_mm"] = self.lift_spin.value()
+        self._draw_cfg["lift_mm"] = self.lift_spin.value() + LIFT_BASELINE_MM
         self._draw_cfg["z_paper_offset_mm"] = self.zpaper_spin.value()
         msg = self.canvas.get_drawing()
         msg["config"] = dict(self._draw_cfg)

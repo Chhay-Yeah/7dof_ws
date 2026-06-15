@@ -19,8 +19,20 @@ arm_controller:
       - joint_6
       - joint_7
 
+    # POSITION command interface (2026-06-14): the JTC forwards interpolated
+    # joint-angle setpoints straight to Gazebo's IgnitionSystem, which holds
+    # each angle against gravity — exactly like the real DaMiao motors in
+    # POS_VEL_MODE (pos_motor_sub.control_pos_vel). This replaces the previous
+    # pure-velocity command interface, which had no position target: it
+    # drooped under gravity and hunted on reach-direction strokes (a centred
+    # vertical drawing line executed at only ~36% coverage; horizontal, which
+    # is base-yaw and gravity-free, tracked fine). A naive velocity-gain bump
+    # (p=10/d=3.0/i=0.5) only crashed DART. Position control removes the
+    # fragile outer loop AND makes the sim a faithful proxy of the
+    # position-targeted hardware. No per-joint PID gains are needed in
+    # position-forwarding mode.
     command_interfaces:
-      - velocity
+      - position
 
     state_interfaces:
       - position
@@ -29,14 +41,3 @@ arm_controller:
     allow_partial_joints_goal: false
     open_loop_control: false
     allow_integration_in_goal_trajectories: true
-
-    # In velocity mode, gains.p maps position error -> commanded velocity.
-    # ff_velocity_scale=1.0 passes the trajectory's velocity as feedforward.
-    gains:
-      joint_1: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }
-      joint_2: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }
-      joint_3: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }
-      joint_4: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }
-      joint_5: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }
-      joint_6: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }
-      joint_7: { p: 8.0,  d: 0.1, i: 0.0, ff_velocity_scale: 1.0 }

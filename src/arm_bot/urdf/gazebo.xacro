@@ -7,64 +7,92 @@
     </hardware>
 
     <joint name="joint_1">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>
 
     <joint name="joint_2">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>
 
     <joint name="joint_3">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>
 
     <joint name="joint_4">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>
 
     <joint name="joint_5">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>
 
     <joint name="joint_6">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>
 
     <joint name="joint_7">
-      <command_interface name="velocity">
-        <param name="min">-3.0</param>
-        <param name="max"> 3.0</param>
-      </command_interface>
+      <!-- POSITION command interface: drive each joint to a target angle,
+           exactly like the real DaMiao motors in POS_VEL_MODE
+           (pos_motor_sub.control_pos_vel = go-to-position). Gazebo's
+           IgnitionSystem holds the commanded angle against gravity, so the
+           JTC no longer has to close a fragile velocity loop (the old
+           velocity command interface drooped/hunted on gravity-loaded
+           reach-direction strokes — see arm_robot_controllers.yaml note). -->
+      <command_interface name="position"/>
       <state_interface name="position"><param name="initial_value">0.0</param></state_interface>
       <state_interface name="velocity"/>
     </joint>

@@ -12,16 +12,22 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPen, QPainterPath, QColor, QBrush
+from PyQt6.QtCore import Qt, QPointF
+from PyQt6.QtGui import QPen, QPainterPath, QColor, QBrush, QPalette
 
-# Default workspace (mm). Matches the batch planner's default 40 mm box.
-DEFAULT_WORKSPACE_MM = 40.0
+# Default workspace (mm). Square canvas matched to the robot's pen-down drawable
+# region: a 2-D reachability map shows a band ~100 mm deep × ~250 mm wide, so
+# 100×100 is the largest square (depth-limited). Keep X==Y so the canvas widget
+# is square and there are no awkward letterbox margins. The drawable area is
+# re-centred into the band by the planner's canvas_anchor (see pendant_backend).
+DEFAULT_WORKSPACE_X_MM = 100.0
+DEFAULT_WORKSPACE_Y_MM = 100.0
+DEFAULT_WORKSPACE_MM = DEFAULT_WORKSPACE_X_MM   # back-compat alias
 
 
 class CanvasView(QGraphicsView):
-    def __init__(self, workspace_x_mm: float = DEFAULT_WORKSPACE_MM,
-                 workspace_y_mm: float = DEFAULT_WORKSPACE_MM) -> None:
+    def __init__(self, workspace_x_mm: float = DEFAULT_WORKSPACE_X_MM,
+                 workspace_y_mm: float = DEFAULT_WORKSPACE_Y_MM) -> None:
         super().__init__()
         self.wx = float(workspace_x_mm)
         self.wy = float(workspace_y_mm)
@@ -92,12 +98,38 @@ class CanvasView(QGraphicsView):
         super().showEvent(event)
         self.fitInView(self.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
+    def drawBackground(self, painter, rect):
+        """Only the drawable workspace (sceneRect) is the Motion-canvas grey
+        (#6b7178); everything OUTSIDE the outlined box is painted the app
+        background so there is no excess grey beyond the drawable area. A
+        border outlines the box. Drawn by the view (not a scene item) so it
+        survives scene_.clear()."""
+        painter.fillRect(rect, self.palette().color(QPalette.ColorRole.Window))  # outside the box
+        painter.fillRect(self.sceneRect(), QColor("#6b7178"))                    # drawable box
+        pen = QPen(QColor("#2b2f36")); pen.setWidth(2); pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(self.sceneRect())
+
     # ── stroke capture ────────────────────────────────────────────────────
+    def _scene_pt(self, view_pos):
+        """Map a viewport point to scene mm and report whether it lies inside
+        the drawable workspace [0,wx]x[0,wy]. Strokes capture ONLY in-bounds
+        points: when the mouse leaves the canvas the stroke must HOLD, not
+        trail the pen along the workspace edge. Trailing the edge drives the
+        robot to its min/max reach where it wobbles — exactly the behaviour to
+        avoid. Returns (QPointF scene_mm, inside_bool)."""
+        p = self.mapToScene(view_pos)
+        inside = (0.0 <= p.x() <= self.wx) and (0.0 <= p.y() <= self.wy)
+        return p, inside
+
     def mousePressEvent(self, event):
+        p, inside = self._scene_pt(event.pos())
+        if not inside:
+            return  # ignore presses that start outside the drawable canvas
         if self._t0 is None:
             self._t0 = time.time()
         self.current_points = []
-        p = self.mapToScene(event.pos())
         self.current_path = QPainterPath(p)
         self.current_points.append(
             {"x": p.x(), "y": p.y(), "t": time.time() - self._t0, "p": 0.5}
@@ -106,7 +138,9 @@ class CanvasView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self.current_path is None:
             return
-        p = self.mapToScene(event.pos())
+        p, inside = self._scene_pt(event.pos())
+        if not inside:
+            return  # mouse left the canvas — hold the stroke, don't trail the edge
         self.current_path.lineTo(p)
         self.scene_.clear()
         for s in self.strokes:

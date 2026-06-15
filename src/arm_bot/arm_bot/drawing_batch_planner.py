@@ -35,7 +35,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from arm_bot.ik_lib import UrdfChain, solve_ik, rot_error
+from arm_bot.ik_lib import UrdfChain, solve_ik, solve_ik_tip, rot_error
 
 
 # ── Quaternion helpers (w, x, y, z convention used internally) ───────────────
@@ -149,6 +149,24 @@ class DrawingBatchPlanner(Node):
         # joint_6 (tight limits) to its stops at the corners and IK degrades,
         # so GUI-supplied workspace sizes are clamped to this.
         self.declare_parameter('max_workspace_mm',       50.0)
+        # Tilt-capable drawing. When True the IK controls the PEN TIP with a
+        # task-priority solver: tip position is primary (so IK doesn't fail on
+        # reachable points) and pen-perpendicular is secondary (held where the
+        # arm has spare DOF, near the canvas centre; the pen tilts only as much
+        # as the edges force it to). This expands the drawable area roughly
+        # from a ~40 mm square to a ~260x110 mm rectangle. False (default)
+        # keeps the original perpendicular-everywhere EE-origin solve.
+        self.declare_parameter('draw_tilt',              False)
+        # Re-centre the canvas on the reachable region: a paper-frame offset
+        # (mm) added to every waypoint so the canvas centre maps into the
+        # middle of the drawable area instead of the begin-pose pen tip (which
+        # sits near the region's edge). 0,0 = canvas centred on the begin tip.
+        self.declare_parameter('canvas_anchor_x_mm',     0.0)
+        self.declare_parameter('canvas_anchor_y_mm',     0.0)
+        # Diagnostic: if >0, log a warning when any waypoint's pen tilt exceeds
+        # this (deg). 0 = uncapped (just report the max). Tilt is not clamped;
+        # the canvas is sized so the worst-case tilt stays acceptable.
+        self.declare_parameter('tilt_max_deg',           0.0)
 
         # ── Trajectory shaping ─────────────────────────────────────────────
         self.declare_parameter('sample_spacing_mm',      2.0)    # along stroke
@@ -217,6 +235,29 @@ class DrawingBatchPlanner(Node):
         # the per-joint delta from the previous point. Verbose (one line
         # per waypoint, ~20–100 lines per drawing), so off by default.
         self.declare_parameter('log_joint_deltas', False)
+        # Populate per-point joint velocities (finite-difference of positions
+        # over the timestamps). This was a feedforward term for the OLD
+        # velocity-command controller. The arm now runs a POSITION command
+        # interface, where the controller only uses these velocities to shape
+        # its cubic-spline interpolation between waypoints — and at an IK
+        # config flip (a large Δq between adjacent points) the finite-diff
+        # velocity is huge, so the spline OVERSHOOTS far past the waypoint and
+        # the pen swings off the path. Default OFF: positions-only points let
+        # the controller compute its own bounded spline velocities (smooth, no
+        # overshoot). Only turn on for a velocity-command controller.
+        self.declare_parameter('velocity_ff', False)
+        # Re-time any trajectory segment that would demand more than this
+        # joint speed (rad/s), by stretching its time_from_start (and all
+        # later points). The IK can produce a large posture change between two
+        # waypoints — most notably the begin_draw→first-approach transition,
+        # where the held begin pose and the line-start IK solution sit in
+        # different arm configurations (~0.8 rad apart on joint_4/joint_7).
+        # Commanded over the normal fraction-of-a-second step that is
+        # physically unexecutable, so the arm lags through it and the pen
+        # swings off the paper (a vertical line then draws at ~36% coverage).
+        # That jump happens pen-UP, so simply giving it enough time fixes it
+        # without affecting drawn-line geometry. 0 disables the pass.
+        self.declare_parameter('max_joint_speed', 1.2)
 
         gp = lambda n: self.get_parameter(n).value
         self.begin_draw_joints = np.array(gp('begin_draw_joints'), dtype=float)
@@ -229,6 +270,15 @@ class DrawingBatchPlanner(Node):
         self.lift_mm           = float(gp('lift_mm'))
         self.z_paper_offset_mm = float(gp('z_paper_offset_mm'))
         self.max_workspace_mm  = float(gp('max_workspace_mm'))
+        self.draw_tilt         = bool(gp('draw_tilt'))
+        self.anchor_x_m        = float(gp('canvas_anchor_x_mm')) / 1000.0
+        self.anchor_y_m        = float(gp('canvas_anchor_y_mm')) / 1000.0
+        self.tilt_max_deg      = float(gp('tilt_max_deg'))
+        # Pen-down tilt above which a draw waypoint is re-solved warm from the
+        # last low-tilt pose (kills cold-seed flipped-basin flukes). The
+        # perpendicular solution exists ~everywhere, so this just nudges the
+        # solver back to it; keep it low but above the genuine edge tilt.
+        self.TILT_RETRY_DEG    = 25.0
         self.ds_mm             = float(gp('sample_spacing_mm'))
         self.v_draw            = float(gp('draw_speed_mm_s'))
         self.v_travel          = float(gp('travel_speed_mm_s'))
@@ -245,6 +295,8 @@ class DrawingBatchPlanner(Node):
         self.joint_weights     = [float(w) for w in gp('joint_weights')]
         self.paper_rotation_deg = int(gp('paper_rotation_deg'))
         self.paper_mirror_x    = bool(gp('paper_mirror_x'))
+        self.velocity_ff       = bool(gp('velocity_ff'))
+        self.max_joint_speed   = float(gp('max_joint_speed'))
 
         # Paper-frame state (filled in from FK at begin_draw on every call)
         self.ox = self.oy = self.z_paper = self.z_lift = 0.0
@@ -364,9 +416,10 @@ class DrawingBatchPlanner(Node):
         paper_xyz_m = self._paper_R_persistent.T @ offset_base_m
         paper_xy_mm = paper_xyz_m[:2] * 1000.0
         # Normalize using workspace extents: 0 = left/bottom edge, 1 = right/top.
-        # paper_xy_mm spans approximately [-wx/2..+wx/2] × [-wy/2..+wy/2].
-        norm_x = float(paper_xy_mm[0] / self.wx + 0.5)
-        norm_y = float(paper_xy_mm[1] / self.wy + 0.5)
+        # The canvas centre maps to the anchor offset (paper mm), so subtract it
+        # before normalising; paper_xy then spans [-wx/2..+wx/2] × [-wy/2..+wy/2].
+        norm_x = float((paper_xy_mm[0] - self.anchor_x_m * 1000.0) / self.wx + 0.5)
+        norm_y = float((paper_xy_mm[1] - self.anchor_y_m * 1000.0) / self.wy + 0.5)
         msg = Point()
         msg.x = norm_x
         msg.y = norm_y
@@ -568,11 +621,16 @@ class DrawingBatchPlanner(Node):
         # Warm-start IK from begin_draw — drawing motion is local to it,
         # so seeding from there gives the cleanest null-space behavior.
         q_seed = q_begin
+        n_high_tilt = 0               # pen-down points left above TILT_RETRY_DEG
         cum_t = t_drawing_start + self.t_settle
         n_unconverged = 0
         max_resid = 0.0
         first_resid = None
+        max_tilt_deg = 0.0   # worst pen tilt off perpendicular (tilt mode only)
+        unconv_kinds = {}    # {kind: count} of waypoints that didn't converge
+        worst_unconv = {'resid': 0.0}
         ik_time_total = 0.0  # Table 4.1 timing — accumulated solve_ik wall time
+        tool_offset = self.pen_offset_m * self.pen_axis_local  # tip in EE frame
 
         for idx, (x, y, z, q_wxyz, dt, _kind) in enumerate(cart_wps):
             # Treat (x, y, z) as paper-frame meters and transform to base
@@ -580,38 +638,77 @@ class DrawingBatchPlanner(Node):
             # direction in base). Orientation stays = R_begin throughout
             # drawing — the wrist tilt is set by begin_draw_joints[6] and
             # the IK keeps it there via the heavy joint_7 weight.
-            ee_pos_base = T_begin[:3, 3] + paper_R @ np.array([x, y, z])
-            T_des = np.eye(4)
-            T_des[:3, :3] = R_begin
-            T_des[:3,  3] = ee_pos_base
+            # Paper-frame target (m), re-centred by the canvas anchor offset.
+            paper_xyz = np.array([x + self.anchor_x_m, y + self.anchor_y_m, z])
             # ALWAYS seed from q_begin and pull toward q_begin in null space.
-            # The prober verified every cell in the 60 mm centred square
-            # converges from this seed, so each waypoint lands in the same
-            # branch. Warm-seeding from q_seed = previous solution let the
-            # IK wander into a far-from-q_begin branch once mid-stroke and
-            # then "stick" there because q_null_target tracked the bad
-            # seed. Re-seeding kills that drift.
-            ik_params_step = {**ik_params, 'q_null_target': q_begin}
+            # The prober verified every cell of the drawable region converges
+            # from this seed, so each waypoint lands in the same branch.
+            # Warm-seeding from q_seed = previous solution let the IK wander
+            # into a far-from-q_begin branch once mid-stroke and then "stick"
+            # there because q_null_target tracked the bad seed. Re-seeding
+            # kills that drift.
             _ik_t0 = time.perf_counter()
-            q_sol, resid, conv = solve_ik(
-                self._chain, T_des, q_begin,
-                use_null_space=True, params=ik_params_step,
-            )
+            if self.draw_tilt:
+                # Control the PEN TIP; hold pen ⟂ paper (R_begin) as a
+                # secondary task that yields to position near the edges.
+                # COLD-seed from q_begin (the perpendicular begin posture): the
+                # solver then prefers the solution closest to perpendicular, so
+                # the pen tilts only as much as each target forces (low tilt in
+                # the middle, more at the edges). On the rare target the cold
+                # basin misses, WARM-retry from the previous solution (a
+                # converged, near-perpendicular neighbour) to guarantee
+                # convergence without letting the tilt drift.
+                tip_params = {'dq_max': 0.05, 'max_iters': 1200, 'tol_pos': 1e-3,
+                              'joint_weights': self.joint_weights, 'null_k': 0.0}
+                p_tip_des = pen_tip_at_begin + paper_R @ paper_xyz
+                # Pure cold-seed from the perpendicular begin posture. The
+                # offline reach map shows this converges at low tilt across the
+                # whole canvas, so no warm fallback is needed (and a warm seed
+                # would let a stray tilted pose cascade down the stroke).
+                q_sol, resid, tilt_rad, conv = solve_ik_tip(
+                    self._chain, p_tip_des, R_begin, tool_offset, q_begin,
+                    params=tip_params)
+                tdeg = np.degrees(tilt_rad)
+                if _kind == 'draw' and conv and tdeg > self.TILT_RETRY_DEG:
+                    n_high_tilt += 1
+                # Only pen-DOWN ('draw') tilt matters for line quality; pen-up
+                # travel/lift/approach points can tilt freely (off the paper).
+                if _kind == 'draw':
+                    max_tilt_deg = max(max_tilt_deg, tdeg)
+            else:
+                # Perpendicular everywhere: control the EE origin, fixed
+                # orientation = R_begin.
+                ee_pos_base = T_begin[:3, 3] + paper_R @ paper_xyz
+                T_des = np.eye(4)
+                T_des[:3, :3] = R_begin
+                T_des[:3,  3] = ee_pos_base
+                ik_params_step = {**ik_params, 'q_null_target': q_begin}
+                q_sol, resid, conv = solve_ik(
+                    self._chain, T_des, q_begin,
+                    use_null_space=True, params=ik_params_step,
+                )
             ik_time_total += time.perf_counter() - _ik_t0
             point_kinds.append(_kind)
 
             if idx == 0:
                 first_resid = resid
                 # Detailed first-call diagnostic so unreachable targets are
-                # immediately obvious from the log.
+                # immediately obvious from the log. In tilt mode the controlled
+                # point is the pen tip; in perpendicular mode it's the EE origin.
                 _, T_final = self._chain.fk(q_sol)
-                e_p = T_des[:3, 3] - T_final[:3, 3]
-                e_r = rot_error(T_final[:3, :3], T_des[:3, :3])
+                if self.draw_tilt:
+                    p_ach = T_final[:3, 3] + T_final[:3, :3] @ tool_offset
+                    p_tgt = p_tip_des
+                else:
+                    p_ach = T_final[:3, 3]
+                    p_tgt = ee_pos_base
+                e_p = p_tgt - p_ach
+                e_r = rot_error(T_final[:3, :3], R_begin)
                 self.get_logger().info(
                     f'IK[0]: pos_err={np.linalg.norm(e_p)*1000:.1f} mm, '
                     f'rot_err={np.linalg.norm(e_r):.3f} rad; '
-                    f'EE ended at ({T_final[0,3]:+.3f}, {T_final[1,3]:+.3f}, '
-                    f'{T_final[2,3]:+.3f}) m; '
+                    f'{"pen tip" if self.draw_tilt else "EE"} ended at '
+                    f'({p_ach[0]:+.3f}, {p_ach[1]:+.3f}, {p_ach[2]:+.3f}) m; '
                     f'q_sol=[{", ".join(f"{v:+.2f}" for v in q_sol)}]'
                 )
                 # Flag joints sitting at their limits (likely culprit)
@@ -627,6 +724,8 @@ class DrawingBatchPlanner(Node):
 
             if not conv:
                 n_unconverged += 1
+                unconv_kinds[_kind] = unconv_kinds.get(_kind, 0) + 1
+                worst_unconv['resid'] = max(worst_unconv['resid'], resid)
             max_resid = max(max_resid, resid)
 
             cum_t += dt
@@ -650,6 +749,23 @@ class DrawingBatchPlanner(Node):
             )
             return
 
+        # Re-time segments that would demand an unexecutable joint speed
+        # (the begin_draw→first-approach posture jump, mainly). Stretches
+        # time_from_start; must run BEFORE _fill_velocities so the velocities
+        # reflect the final timing.
+        if self.max_joint_speed > 0.0:
+            self._retime_for_joint_speed(traj, self.max_joint_speed)
+
+        # Velocity feedforward: fill pt.velocities from a central finite
+        # difference of positions over the timestamps. The velocity-mode JTC
+        # multiplies these by ff_velocity_scale (=1.0) and feeds them forward,
+        # so the proportional gain only has to correct residual error instead
+        # of driving the whole motion. Endpoints get zero velocity (the
+        # trajectory starts and ends at rest). Without this the points are
+        # positions-only and the pen badly under-tracks the sweep.
+        if self.velocity_ff:
+            self._fill_velocities(traj)
+
         if self.log_joint_deltas:
             self._dump_trajectory(traj, point_kinds)
 
@@ -659,6 +775,19 @@ class DrawingBatchPlanner(Node):
             f'duration={cum_t:.1f}s, first_residual={first_resid:.2e}, '
             f'max_residual={max_resid:.2e}, unconverged={n_unconverged}'
         )
+        if n_unconverged:
+            self.get_logger().warn(
+                f'unconverged by kind: {unconv_kinds} '
+                f'(worst residual {worst_unconv["resid"]:.2e})')
+        if self.draw_tilt:
+            msg = (f'tilt mode: max pen tilt off perpendicular = {max_tilt_deg:.1f} deg'
+                   f'; pen-down points above {self.TILT_RETRY_DEG:.0f} deg: {n_high_tilt}')
+            if self.tilt_max_deg > 0.0 and max_tilt_deg > self.tilt_max_deg:
+                self.get_logger().warn(
+                    msg + f' (exceeds tilt_max_deg={self.tilt_max_deg:.0f}; '
+                    f'shrink workspace_x/y_mm or re-centre canvas_anchor_*)')
+            else:
+                self.get_logger().info(msg)
         # Table 4.1 timing — read these off the console after a drawing run.
         n_ik = len(cart_wps)
         plan_ms = (time.perf_counter() - t_plan_start) * 1e3
@@ -670,6 +799,70 @@ class DrawingBatchPlanner(Node):
         )
 
     # ── Planning helpers ───────────────────────────────────────────────────
+
+    def _retime_for_joint_speed(self, traj: JointTrajectory,
+                                max_speed: float) -> None:
+        """Stretch any segment whose required joint speed exceeds max_speed
+        (rad/s) by pushing out its time_from_start and every later point's.
+        Leaves feasible segments untouched. Logs the total time added."""
+        pts = traj.points
+        if len(pts) < 2:
+            return
+        added = 0.0
+        n_stretched = 0
+        worst = (0, 0.0, 0.0)  # (idx, required_speed, dq)
+        for i in range(1, len(pts)):
+            dq = np.abs(np.asarray(pts[i].positions)
+                        - np.asarray(pts[i - 1].positions))
+            dq_max = float(dq.max()) if dq.size else 0.0
+            t_prev = pts[i - 1].time_from_start.sec + \
+                pts[i - 1].time_from_start.nanosec * 1e-9
+            t_cur = pts[i].time_from_start.sec + \
+                pts[i].time_from_start.nanosec * 1e-9
+            dt = t_cur - t_prev
+            dt_min = dq_max / max_speed
+            if dt_min > dt + 1e-6:
+                extra = dt_min - dt
+                added += extra
+                n_stretched += 1
+                speed = dq_max / dt if dt > 1e-9 else float('inf')
+                if speed > worst[1]:
+                    worst = (i, speed, dq_max)
+                # push this point and all later points out by `extra`
+                for k in range(i, len(pts)):
+                    t = pts[k].time_from_start.sec + \
+                        pts[k].time_from_start.nanosec * 1e-9 + extra
+                    pts[k].time_from_start = self._seconds_to_duration(t)
+        if n_stretched:
+            self.get_logger().info(
+                f'retimed {n_stretched} segment(s) to cap joint speed at '
+                f'{max_speed:.1f} rad/s (+{added:.1f}s total; worst was '
+                f'{worst[1]:.1f} rad/s, Δq={worst[2]:.2f} rad at point {worst[0]})'
+            )
+
+    @staticmethod
+    def _fill_velocities(traj: JointTrajectory) -> None:
+        """Set pt.velocities on every point via a central finite difference of
+        positions over time_from_start. Endpoints are clamped to zero so the
+        motion starts/ends at rest. No-op for trajectories with < 3 points."""
+        pts = traj.points
+        n = len(pts)
+        if n < 2:
+            for pt in pts:
+                pt.velocities = [0.0] * len(pt.positions)
+            return
+        t = np.array([p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+                      for p in pts])
+        q = np.array([p.positions for p in pts], dtype=float)  # (n, ndof)
+        v = np.zeros_like(q)
+        # interior points: central difference (n-1 .. 1)
+        for i in range(1, n - 1):
+            dt = t[i + 1] - t[i - 1]
+            if dt > 1e-9:
+                v[i] = (q[i + 1] - q[i - 1]) / dt
+        # endpoints stay at rest (start at q_start, end after lift)
+        for i, pt in enumerate(pts):
+            pt.velocities = v[i].tolist()
 
     @staticmethod
     def _seconds_to_duration(t_sec: float) -> Duration:
@@ -757,6 +950,13 @@ class DrawingBatchPlanner(Node):
                         # Too few points for cubic — linear is fine
                         xs_s = np.interp(u_new, u, xs)
                         ys_s = np.interp(u_new, u, ys)
+
+            # Clamp resampled points to the canvas box: a cubic spline through
+            # sharp corners can overshoot past the edges, pushing waypoints
+            # outside the reachable drawable area (IK miss / extreme tilt). The
+            # canvas is sized to be reachable, so clamping keeps every point in.
+            xs_s = np.clip(xs_s, self.ox, self.ox + self.wx)
+            ys_s = np.clip(ys_s, self.oy, self.oy + self.wy)
 
             x0_mm, y0_mm = float(xs_s[0]),  float(ys_s[0])
             xN_mm, yN_mm = float(xs_s[-1]), float(ys_s[-1])

@@ -261,3 +261,141 @@ def solve_ik(
         q = np.clip(q + dq, chain.q_min, chain.q_max)
 
     return q, err_norm, converged
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    return np.array([[0.0, -v[2], v[1]],
+                     [v[2], 0.0, -v[0]],
+                     [-v[1], v[0], 0.0]])
+
+
+DEFAULT_TIP_IK_PARAMS = dict(
+    dq_max=0.05,
+    max_iters=800,
+    tol_pos=1e-3,
+    lam_pos=0.04,
+    lam_rot=0.06,
+    joint_weights=None,
+    # Gentle posture pull toward q_null_target in the leftover null space
+    # (after position + orientation). Keeps strokes in a consistent branch and,
+    # when orient_secondary is off, is the perpendicular-keeping term.
+    null_k=0.0,
+    q_null_target=None,
+    # Run the explicit orientation (perpendicular) secondary task. Off = rely on
+    # the null_k posture pull instead (more robust convergence, smoother tilt).
+    orient_secondary=True,
+)
+
+
+def solve_ik_tip(
+    chain: UrdfChain,
+    p_tip_des: np.ndarray,
+    R_des: np.ndarray,
+    tool_offset: np.ndarray,
+    q_seed: np.ndarray,
+    *,
+    params: Optional[dict] = None,
+) -> tuple[np.ndarray, float, float, bool]:
+    """Task-priority IK for a TOOL TIP offset from the chain tip.
+
+    Used for tilt-capable drawing. The pen tip is ``tool_offset`` (a vector in
+    the chain-tip local frame, e.g. ``[pen_len, 0, 0]``) away from the IK tip
+    link. Two prioritised tasks:
+
+      1. PRIMARY  — tip position ``p_tip_des`` (3-DOF). Always solved, so IK
+         only "fails" when the tip is genuinely outside the position-reachable
+         set — not because orientation couldn't be held.
+      2. SECONDARY — tool orientation toward ``R_des`` (pen ⟂ paper), solved in
+         the null space of the primary. The wrist keeps the pen perpendicular
+         where it has spare DOF (canvas centre) and tilts only as much as the
+         position task forces it to (canvas edges).
+
+    Controlling the TIP (not the chain-tip origin) is essential once tilt is
+    allowed: with a tilting wrist the tip swings up to ``|tool_offset|`` away
+    from the chain-tip origin, so commanding the origin would misplace the pen.
+
+    Returns ``(q, pos_err, tilt_rad, converged)`` where ``tilt_rad`` is the
+    angle between the achieved pen axis and the ``R_des`` pen axis.
+    """
+    P = {**DEFAULT_TIP_IK_PARAMS, **(params or {})}
+    q = np.array(q_seed, dtype=float).copy()
+    n = chain.n
+    In = np.eye(n)
+    I3 = np.eye(3)
+    d_local = np.asarray(tool_offset, dtype=float)
+    d_hat = d_local / np.linalg.norm(d_local)
+
+    if P["joint_weights"] is None:
+        Winv = In
+    else:
+        w = np.asarray(P["joint_weights"], dtype=float)
+        if w.shape != (n,):
+            raise ValueError(f'joint_weights must have {n} entries, got {w.shape[0]}')
+        Winv = np.diag(1.0 / w)
+    q_null = (np.asarray(P["q_null_target"], dtype=float)
+              if P["q_null_target"] is not None else chain.q_mid)
+
+    pos_err = float("inf")
+    converged = False
+    q_best = q.copy()
+    err_best = float("inf")
+    for _ in range(P["max_iters"]):
+        J, T = chain.jacobian(q)
+        R = T[:3, :3]
+        r = R @ d_local                       # chain-tip origin -> pen tip (base)
+        p_tip = T[:3, 3] + r
+        Jv = J[:3, :] - _skew(r) @ J[3:, :]   # linear Jacobian transported to tip
+        Jw = J[3:, :]
+
+        e_pos = p_tip_des - p_tip
+        pos_err = float(np.linalg.norm(e_pos))
+        # Keep the best (closest) configuration so a later DLS wander can never
+        # return a worse pose than what was already reached — bounds divergence.
+        if pos_err < err_best:
+            err_best = pos_err
+            q_best = q.copy()
+        if pos_err < P["tol_pos"]:
+            converged = True
+            break
+
+        # PRIMARY: tip position (weighted DLS).
+        Mp = Jv @ Winv @ Jv.T + (P["lam_pos"] ** 2) * I3
+        Pp = Winv @ Jv.T @ np.linalg.inv(Mp)        # n x 3 weighted DLS pinv
+        dq1 = Pp @ e_pos
+        N1 = In - Pp @ Jv                           # primary null-space projector
+        dq = dq1
+        Nrest = N1
+
+        # SECONDARY (optional): orientation toward R_des, projected into N1.
+        # An explicit orientation task pulls hard to perpendicular but can trap
+        # the position solve in a bad basin on thin filaments. With it OFF, the
+        # null_k posture pull toward q_null (= the perpendicular begin posture)
+        # keeps the pen near-perpendicular while position always converges.
+        if P["orient_secondary"]:
+            e_rot = rot_error(R, R_des)
+            J2 = Jw @ N1
+            Ms = J2 @ Winv @ J2.T + (P["lam_rot"] ** 2) * I3
+            P2 = Winv @ J2.T @ np.linalg.inv(Ms)
+            dq2 = P2 @ (e_rot - Jw @ dq1)
+            dq = dq1 + N1 @ dq2
+            Nrest = N1 @ (In - P2 @ J2)
+
+        # TERTIARY (optional): posture pull toward q_null in the leftover space —
+        # this is the perpendicular-keeping term when orient_secondary is off.
+        if P["null_k"] > 0.0:
+            dq = dq + Nrest @ (P["null_k"] * (q_null - q))
+
+        mag = float(np.linalg.norm(dq))
+        if mag > P["dq_max"]:
+            dq *= P["dq_max"] / mag
+        q = np.clip(q + dq, chain.q_min, chain.q_max)
+
+    # Return the best configuration reached (not the last iterate, which may
+    # have wandered if it never converged).
+    q = q_best
+    pos_err = err_best
+    _, T = chain.fk(q)
+    pen_now = T[:3, :3] @ d_hat
+    pen_des = R_des @ d_hat
+    tilt_rad = float(np.arccos(np.clip(np.dot(pen_now, pen_des), -1.0, 1.0)))
+    return q, pos_err, tilt_rad, converged

@@ -176,6 +176,12 @@ class Joystick(QWidget):
         self._ring_active = False
         self.x = self.y = self.twist = 0.0
         self._timer.stop()
+        # Emit one final centered tick so the consumer learns the jog stopped
+        # (the timer is now stopped, so _tick won't fire again). The Cartesian
+        # bridge uses this zero tick to re-anchor and let the jog IK go idle;
+        # without it the IK keeps chasing the last leading target.
+        if self.on_jog is not None:
+            self.on_jog(0.0, 0.0, 0.0)
         self.update()
 
     def _update_knob(self, pos):

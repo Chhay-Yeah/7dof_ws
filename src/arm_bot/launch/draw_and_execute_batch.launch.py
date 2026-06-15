@@ -31,7 +31,7 @@ def generate_launch_description():
                  # roughly perpendicular to the paper for full contact.
                  # The 10× weight on joint_7 below holds it here throughout
                  # the drawing, so no mid-trajectory wrist rolling is needed.
-                 'begin_draw_joints': [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0],
+                 'begin_draw_joints': [0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0],
                  # Virtual pen length beyond the EE link (no real gripper).
                  'pen_offset_mm':         100.0,
                  # This URDF's EE +X is the "along the arm" axis (verified

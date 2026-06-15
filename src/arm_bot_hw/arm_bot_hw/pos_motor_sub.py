@@ -13,6 +13,14 @@ from .lib.DM_motor import (
 
 # Velocity limit sent with every position command (rad/s)
 DEFAULT_VEL = 5.0
+# Velocity floor used when /joint_states reports ~zero (or no) velocity. The old
+# behaviour fell back to DEFAULT_VEL (5.0) here, which made the POS_VEL motor
+# slam toward a very-close target at full speed every time the commanded velocity
+# dithered through zero (start/end of a move, zero-crossings) -> overshoot ->
+# correct = jitter, worst on small/slow moves. A small floor lets the motor ease
+# to the target instead. Large moves are unaffected (they carry a real nonzero
+# velocity and never hit this fallback).
+MIN_VEL = 0.5
 
 
 class PosMotorSub(Node):
@@ -20,6 +28,7 @@ class PosMotorSub(Node):
         super().__init__('pos_motor_sub')
 
         self.default_vel = DEFAULT_VEL
+        self.min_vel = MIN_VEL   # velocity floor at ~zero commanded velocity
 
         # ── Motor IDs ──────────────────────────────────────────────────────────
         canid1 = 0x01;  mstid1 = 0x11
@@ -113,9 +122,12 @@ class PosMotorSub(Node):
             target_pos = msg.position[i] if i < len(msg.position) else 0.0
             if can_id in self.inverted_motors:
                 target_pos = -target_pos
+            # Use the real joint velocity when /joint_states provides a nonzero
+            # one; at ~zero velocity ease to the target at a small floor instead
+            # of slamming at DEFAULT_VEL (the small-move jitter, see MIN_VEL).
             target_vel = (
                 abs(msg.velocity[i]) if i < len(msg.velocity) and msg.velocity[i] != 0.0
-                else self.default_vel
+                else self.min_vel
             )
 
             self.control.control_pos_vel(motor, target_pos, target_vel)
