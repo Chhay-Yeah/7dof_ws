@@ -2,9 +2,14 @@
 
   * Centre knob: drag to set (x, y) in [-1, 1] each; springs back to centre on
     release.
-  * Outer ring (a circular arrow, offset out from the knob so it's easy to grab
-    without touching the knob): drag around it to set twist in [-1, 1]; springs
-    back to 0 on release.
+  * Outer ring (two striped grips you grab and turn): drag around it to set
+    twist in [-1, 1]; springs back to 0 on release. A read-only quarter-circle
+    arrow sits just outside the ring on the right as a direction legend (turn
+    toward the "+" arrow for the positive direction); it is not interactive.
+
+Any axis whose label is empty ("" via :meth:`set_labels`) is hidden and idle —
+e.g. joint-7 mode binds only the Y axis, so the X labels, the twist ring and
+its arrow legend are not drawn.
 
 While either control is active the widget calls `on_jog(x, y, twist)` at a
 fixed rate, so the consumer can stream velocity-style jog commands. The values
@@ -17,7 +22,7 @@ import math
 
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF
-from PyQt6.QtGui import QPainter, QPen, QBrush, QColor
+from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QPolygonF
 
 
 class Joystick(QWidget):
@@ -46,10 +51,13 @@ class Joystick(QWidget):
     # ── geometry helpers (recomputed from current size) ───────────────────
     def _metrics(self):
         s = min(self.width(), self.height())
-        c = QPointF(self.width() / 2.0, self.height() / 2.0)
+        # Centre the round control on the shorter (vertical) dimension, so a
+        # widget wider than tall leaves blank space on the RIGHT for the twist
+        # legend. For a square widget this is just the centre.
+        c = QPointF(s / 2.0, self.height() / 2.0)
         r_base = s * 0.22       # knob travel radius
         r_knob = s * 0.11
-        r_ring = s * 0.40       # ring centreline radius (offset out from knob)
+        r_ring = s * 0.40       # twist-ring centreline radius (offset out from knob)
         ring_w = s * 0.07
         return c, r_base, r_knob, r_ring, ring_w
 
@@ -58,16 +66,60 @@ class Joystick(QWidget):
         c, r_base, r_knob, r_ring, ring_w = self._metrics()
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = min(self.width(), self.height())
 
-        # twist ring (track)
+        # twist ring + grips (the rotary "grab and turn" control) — behind the
+        # knob, and only when a twist axis is bound (joint-7 mode leaves twist
+        # idle/unlabelled, so the ring is hidden).
+        if self.twist_label:
+            self._paint_twist_ring(p, c, r_ring, ring_w)
+
+        # base well
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(QColor("#2b2f36")))
+        p.drawEllipse(c, r_base + r_knob * 0.4, r_base + r_knob * 0.4)
+
+        # knob at current (x,y)
+        kx = c.x() + self.x * r_base
+        ky = c.y() - self.y * r_base
+        p.setBrush(QBrush(QColor("#6aa9ff" if self._knob_active else "#4f9bff")))
+        p.drawEllipse(QPointF(kx, ky), r_knob, r_knob)
+
+        # direction labels: which way drives +/- of each axis. Each label is
+        # nudged toward the centre per the pendant layout (Y by 5 px, X by
+        # 10 px); an axis with an empty label (e.g. X in joint-7 mode) is
+        # skipped entirely.
+        p.setPen(QColor("#ffa726"))   # orange
+        f = p.font()
+        f.setBold(True)
+        f.setPointSize(max(7, int(s * 0.05)))
+        p.setFont(f)
+        rl = s * 0.345
+
+        def lab(px, py, text, w=78, h=18):
+            p.drawText(QRectF(px - w / 2, py - h / 2, w, h),
+                       Qt.AlignmentFlag.AlignCenter, text)
+
+        if self.y_label:
+            lab(c.x(), c.y() - rl + 5, "+" + self.y_label)   # +Y lowered 5 px
+            lab(c.x(), c.y() + rl - 5, "−" + self.y_label)   # −Y raised 5 px
+        if self.x_label:
+            lab(c.x() + rl - 10, c.y(), "+" + self.x_label)  # +X 10 px to left
+            lab(c.x() - rl + 10, c.y(), "−" + self.x_label)  # −X 10 px to right
+        # twist direction legend: a curve + arrows just outside the ring, right
+        # side. Read-only — the ring is what you grab; this only shows +/−.
+        if self.twist_label:
+            self._paint_twist_arc(p, c, r_ring, ring_w, s)
+
+    # ── twist ring + grips (rotary "grab and turn" twist control) ─────────
+    def _paint_twist_ring(self, p, c, r_ring, ring_w):
+        # ring track
         p.setPen(QPen(QColor("#3a3f47"), ring_w))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        ring_rect = QRectF(c.x() - r_ring, c.y() - r_ring, 2 * r_ring, 2 * r_ring)
-        p.drawEllipse(ring_rect)
-
-        # twist handle: two striped rectangular grips sitting on the ring at
-        # 3- and 9-o'clock, rotating with the current twist so it reads as a
-        # rotary "grab and turn" control (rectangle box with 90-deg stripes).
+        p.drawEllipse(QRectF(c.x() - r_ring, c.y() - r_ring, 2 * r_ring, 2 * r_ring))
+        # two striped rectangular grips at 3- and 9-o'clock, rotating with the
+        # current twist so it reads as a rotary control (box with 90° knurl
+        # stripes).
         p.save()
         p.translate(c)
         # Negated so the grip rotates *with* the mouse (Qt's rotate is CW-
@@ -100,37 +152,55 @@ class Joystick(QWidget):
         p.drawArc(arc, int(218 * 16), int(34 * 16))
         p.restore()
 
-        # base well
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor("#2b2f36")))
-        p.drawEllipse(c, r_base + r_knob * 0.4, r_base + r_knob * 0.4)
+    # ── twist direction legend (read-only curve + arrows outside the ring) ──
+    def _paint_twist_arc(self, p, c, r_ring, ring_w, s):
+        # 90° BLUE arc (±45° about 3 o'clock) sitting detached to the right of
+        # the ring, an arrowhead + sign at each end. It only shows which way to
+        # turn the ring: the CW (bottom) end is "+" and the CCW (top) end is "−",
+        # matching on_jog's twist negation (a clockwise turn drives +).
+        r = r_ring + ring_w * 1.5      # detached, clear of the grips
+        half = 45.0
+        col = QColor("#4f9bff")        # blue, like the ring grips
+        pen = QPen(col, max(2.5, s * 0.014))
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawArc(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r),
+                  int(-half * 16), int(2 * half * 16))
 
-        # knob at current (x,y)
-        kx = c.x() + self.x * r_base
-        ky = c.y() - self.y * r_base
-        p.setBrush(QBrush(QColor("#6aa9ff" if self._knob_active else "#4f9bff")))
-        p.drawEllipse(QPointF(kx, ky), r_knob, r_knob)
-
-        # direction labels: which way drives +/- of each axis, plus the twist
-        s = min(self.width(), self.height())
-        p.setPen(QColor("#ffa726"))   # orange
+        h = math.radians(half)
+        head = max(8.0, s * 0.05)
+        lab_off = s * 0.06
         f = p.font()
         f.setBold(True)
         f.setPointSize(max(7, int(s * 0.05)))
-        p.setFont(f)
-        rl = s * 0.345
+        for sign in (+1, -1):          # +1 = top end (CCW, −); −1 = bottom (CW, +)
+            ang = sign * h
+            ex = c.x() + r * math.cos(ang)
+            ey = c.y() - r * math.sin(ang)
+            # outward tangent — the arrowhead grows out of the line end along it
+            self._arrow_head(p, QPointF(ex, ey),
+                             -math.sin(h), -sign * math.cos(h), head, col)
+            lx = c.x() + (r + lab_off) * math.cos(ang)
+            ly = c.y() - (r + lab_off) * math.sin(ang)
+            p.setPen(QColor("#ffa726"))   # +/- labels stay orange
+            p.setFont(f)
+            p.drawText(QRectF(lx - 18, ly - 9, 36, 18),
+                       Qt.AlignmentFlag.AlignCenter,
+                       ("−" if sign > 0 else "+") + self.twist_label)
 
-        def lab(px, py, text, w=78, h=18):
-            p.drawText(QRectF(px - w / 2, py - h / 2, w, h),
-                       Qt.AlignmentFlag.AlignCenter, text)
-
-        lab(c.x(), c.y() - rl, "+" + self.y_label)
-        lab(c.x(), c.y() + rl, "−" + self.y_label)
-        lab(c.x() + rl, c.y(), "+" + self.x_label)
-        lab(c.x() - rl, c.y(), "−" + self.x_label)
-        # twist axis label in the top-left corner (free space outside the ring)
-        p.drawText(QRectF(6, 4, self.width() - 12, 18),
-                   Qt.AlignmentFlag.AlignLeft, "↻ " + self.twist_label)
+    @staticmethod
+    def _arrow_head(p, base, ux, uy, size, col):
+        # Filled triangle: apex `size` BEYOND the curve end along (ux,uy) (a unit
+        # vector), back corners straddling the end, so the curve runs into it.
+        px, py = -uy, ux
+        apex = QPointF(base.x() + ux * size, base.y() + uy * size)
+        w = size * 0.55
+        b1 = QPointF(base.x() + px * w, base.y() + py * w)
+        b2 = QPointF(base.x() - px * w, base.y() - py * w)
+        p.setPen(QPen(col, 1))
+        p.setBrush(QBrush(col))
+        p.drawPolygon(QPolygonF([apex, b1, b2]))
 
     # ── interaction ───────────────────────────────────────────────────────
     def _hit(self, pos):
@@ -138,7 +208,8 @@ class Joystick(QWidget):
         d = math.hypot(pos.x() - c.x(), pos.y() - c.y())
         if d <= r_base + r_knob:
             return "knob"
-        if r_ring - ring_w <= d <= r_ring + ring_w:
+        # twist: anywhere on the ring band (grab and turn), only when bound
+        if self.twist_label and r_ring - ring_w <= d <= r_ring + ring_w:
             return "ring"
         return None
 

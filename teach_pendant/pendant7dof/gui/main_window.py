@@ -14,7 +14,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QStackedWidget, QButtonGroup, QVBoxLayout,
     QHBoxLayout, QGridLayout, QPushButton, QLabel, QComboBox, QLineEdit,
-    QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QDial, QStyle, QCheckBox,
+    QDoubleSpinBox, QGroupBox, QSizePolicy, QFrame, QStyle, QCheckBox,
     QListWidget, QListWidgetItem, QScrollArea, QGraphicsOpacityEffect,
     QGraphicsView, QGraphicsScene, QGraphicsItem, QGraphicsPathItem,
     QGraphicsLineItem, QRadioButton, QMenu,
@@ -804,8 +804,7 @@ class MainWindow(QMainWindow):
         self._hist_idx = -1
         self._page_anim: QPropertyAnimation | None = None
         self.jog_mode = "joint"     # 'joint' | 'cartesian'
-        self.jog_group = 0          # 0 -> joints 1-3, 1 -> joints 4-6
-        self._dial7_pending: float | None = None  # joint-7 dial target to flush
+        self.jog_group = 0          # 0 -> joints 1-3, 1 -> joints 4-6, 2 -> joint 7
         self._tasks: list[dict] = []   # saved Motion tasks (in-memory only)
         self._task_seq = 0          # running counter for default task names
         self._editing_task: int | None = None  # index being edited (None = new)
@@ -1120,29 +1119,19 @@ class MainWindow(QMainWindow):
         iv.addStretch(1)
         info.setGeometry(4, 4, 168, 250)
 
-        # Joystick centred in C6 → (200, 440).
+        # Joystick: the round control is centred in C6 → (200, 440), but the
+        # widget is wider than tall so the twist-direction legend (a curve +
+        # arrows) has room to its right. The control centres on the widget's
+        # vertical extent (240) → at widget-x 120 = parent-x 200; the extra
+        # width spills right into the space the old joint-7 dial vacated.
         self.joystick = Joystick(on_jog=self._on_joy)
         self.joystick.setParent(w)
-        self.joystick.setFixedSize(240, 240)
+        self.joystick.setFixedSize(330, 240)
         self.joystick.move(200 - 120, 440 - 120)   # (80, 320)
 
-        # Joint 7 dial centred in J6 → (760, 440).
-        self.joint7_box = QGroupBox("Joint 7", w)
-        v7 = QVBoxLayout(self.joint7_box)
-        v7.setContentsMargins(6, 4, 6, 4)
-        self.dial7 = QDial()
-        self.dial7.setRange(-160, 160)   # 0.01 rad per step over [-1.6, 1.6]
-        self.dial7.setNotchesVisible(True)
-        self.dial7.setWrapping(False)
-        self.dial7.setFixedSize(94, 94)
-        self.dial7.valueChanged.connect(self._on_dial7)
-        v7.addWidget(self.dial7, alignment=Qt.AlignmentFlag.AlignCenter)
-        self.dial7_value_label = QLabel("+0.000 rad")
-        self.dial7_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.dial7_value_label.setStyleSheet("font-family: monospace;")
-        v7.addWidget(self.dial7_value_label)
-        self.joint7_box.setFixedSize(126, 156)
-        self.joint7_box.move(760 - 63, 440 - 78)    # (697, 362)
+        # Joint 7 has no dial any more — it's the third group on the joystick
+        # (the group toggle cycles 1–3 → 4–6 → Joint 7), driven by +Y/−Y. The
+        # old J6 dial slot (≈760, 440) is intentionally left empty.
 
         # Control cluster anchored with the Mode selector at K1 (x = 800),
         # then Joint selector (K2), Home (K3), Speed (K4).
@@ -1798,18 +1787,23 @@ class MainWindow(QMainWindow):
         self._update_jog_ui()
 
     def _toggle_jog_group(self) -> None:
-        self.jog_group = 1 - self.jog_group
+        # Cycle 1–3 → 4–6 → Joint 7 → 1–3 (same button as the 1–3/4–6 switch).
+        self.jog_group = (self.jog_group + 1) % 3
         self._update_jog_ui()
 
     def _update_jog_ui(self) -> None:
         cartesian = self.jog_mode == "cartesian"
         self.mode_toggle_btn.setText("Mode: Cartesian" if cartesian else "Mode: Joint")
         self.group_toggle_btn.setVisible(not cartesian)
-        self.joint7_box.setVisible(not cartesian)
         self.joint_set_box.setVisible(not cartesian)
         self.cart_set_box.setVisible(cartesian)
         if cartesian:
             self.joystick.set_labels("X", "Y", "Z")
+        elif self.jog_group == 2:
+            # Joint 7 alone: only the vertical (+Y/−Y) axis drives it; the X
+            # axis and the twist arc carry no label, so they're hidden + idle.
+            self.group_toggle_btn.setText("Joint 7")
+            self.joystick.set_labels("", "J7", "")
         else:
             base = 0 if self.jog_group == 0 else 3
             self.group_toggle_btn.setText("Joints 1–3" if self.jog_group == 0 else "Joints 4–6")
@@ -1829,13 +1823,12 @@ class MainWindow(QMainWindow):
             if x == 0.0 and y == 0.0 and twist == 0.0:
                 return   # release in joint mode: nothing to command
             k = JOINT_STEP_PER_TICK * spd
-            base = 0 if self.jog_group == 0 else 3
-            self.node.jog_joints({base: x * k, base + 1: y * k, base + 2: twist * k})
-
-    def _on_dial7(self, value: int) -> None:
-        rad = value / 100.0
-        self._dial7_pending = rad
-        self.dial7_value_label.setText(f"{rad:+.3f} rad")
+            if self.jog_group == 2:
+                # Joint 7 (index 6) on the vertical axis only; X/twist ignored.
+                self.node.jog_joints({6: y * k})
+            else:
+                base = 0 if self.jog_group == 0 else 3
+                self.node.jog_joints({base: x * k, base + 1: y * k, base + 2: twist * k})
 
     def _do_set_joint(self) -> None:
         text = self.set_joint_input.text().strip()
@@ -2031,18 +2024,6 @@ class MainWindow(QMainWindow):
         for lbl, name, q in zip(self.joint_info_labels, JOINT_NAMES, joints):
             lbl.setText(f"{name} = {q:+.3f}")
         self.ee_info_label.setText(ee_txt)
-
-        # Joint-7 dial: flush a pending target (throttled to this 10 Hz tick),
-        # otherwise track the live joint while the user isn't turning it.
-        if self._dial7_pending is not None:
-            if not self.node.estopped:
-                self.node.set_joint(6, self._dial7_pending, duration_s=0.3)
-            self._dial7_pending = None
-        elif not self.dial7.isSliderDown():
-            self.dial7.blockSignals(True)
-            self.dial7.setValue(int(round(joints[6] * 100)))
-            self.dial7.blockSignals(False)
-            self.dial7_value_label.setText(f"{joints[6]:+.3f} rad")
 
         estopped = self.node.estopped
         self.status_estop_label.setText("E-stop: ACTIVE" if estopped else "E-stop: clear")
