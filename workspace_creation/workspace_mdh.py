@@ -193,7 +193,8 @@ def report(P, convention, hull_v, vox):
     return m
 
 
-def make_plots(P, convention, out_prefix, max_plot=40000):
+def make_plots(P, convention, out_prefix, max_plot=40000,
+               cmap="viridis", base_color="red"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -211,8 +212,8 @@ def make_plots(P, convention, out_prefix, max_plot=40000):
     # 3D scatter
     fig = plt.figure(figsize=(8, 7))
     ax = fig.add_subplot(111, projection="3d")
-    ax.scatter(x, y, z, c=c, cmap="viridis", s=1, alpha=0.25, linewidths=0)
-    ax.scatter([0], [0], [0], c="red", s=40, marker="^", label="base")
+    ax.scatter(x, y, z, c=c, cmap=cmap, s=1, alpha=0.25, linewidths=0)
+    ax.scatter([0], [0], [0], c=base_color, s=40, marker="^", label="base")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]"); ax.set_zlabel("z [m]")
     ax.set_title(f"7-DOF reachable workspace  (Monte-Carlo, {convention} DH, "
                  f"{P.shape[0]:,} samples)")
@@ -229,14 +230,14 @@ def make_plots(P, convention, out_prefix, max_plot=40000):
     # three orthographic projections
     r = np.hypot(x, y)
     fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    axs[0].scatter(x, y, s=1, alpha=0.2, c=c, cmap="viridis", linewidths=0)
-    axs[0].plot(0, 0, "r^"); axs[0].set_title("Top view  (X-Y)")
+    axs[0].scatter(x, y, s=1, alpha=0.2, c=c, cmap=cmap, linewidths=0)
+    axs[0].plot(0, 0, "^", color=base_color); axs[0].set_title("Top view  (X-Y)")
     axs[0].set_xlabel("x [m]"); axs[0].set_ylabel("y [m]")
-    axs[1].scatter(x, z, s=1, alpha=0.2, c=c, cmap="viridis", linewidths=0)
-    axs[1].plot(0, 0, "r^"); axs[1].set_title("Front view  (X-Z)")
+    axs[1].scatter(x, z, s=1, alpha=0.2, c=c, cmap=cmap, linewidths=0)
+    axs[1].plot(0, 0, "^", color=base_color); axs[1].set_title("Front view  (X-Z)")
     axs[1].set_xlabel("x [m]"); axs[1].set_ylabel("z [m]")
-    axs[2].scatter(r, z, s=1, alpha=0.2, c=c, cmap="viridis", linewidths=0)
-    axs[2].plot(0, 0, "r^"); axs[2].set_title("Side profile  (radius r vs Z)")
+    axs[2].scatter(r, z, s=1, alpha=0.2, c=c, cmap=cmap, linewidths=0)
+    axs[2].plot(0, 0, "^", color=base_color); axs[2].set_title("Side profile  (radius r vs Z)")
     axs[2].set_xlabel("r = sqrt(x^2+y^2) [m]"); axs[2].set_ylabel("z [m]")
     for a in axs:
         a.set_aspect("equal", "box"); a.grid(True, alpha=0.3)
@@ -260,6 +261,11 @@ def main():
                     help="voxel size [m] for the volume estimate (default 0.02)")
     ap.add_argument("--out", default="workspace",
                     help="output file prefix (default 'workspace')")
+    ap.add_argument("--cmap", default="viridis",
+                    help="matplotlib colormap for the point cloud "
+                         "(default 'viridis')")
+    ap.add_argument("--base-color", default="red",
+                    help="colour of the base marker (default 'red')")
     ap.add_argument("--no-plots", action="store_true")
     ap.add_argument("--save-cloud", action="store_true",
                     help="also save the full point cloud as .npy")
@@ -291,7 +297,8 @@ def main():
         print(f"wrote {args.out}_cloud.npy  ({P.shape[0]} points)")
 
     if not args.no_plots:
-        make_plots(P, args.convention, args.out)
+        make_plots(P, args.convention, args.out,
+                   cmap=args.cmap, base_color=args.base_color)
 
 
 if __name__ == "__main__":
