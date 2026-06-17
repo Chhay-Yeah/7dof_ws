@@ -119,6 +119,12 @@ class DrawingBatchPlanner(Node):
         # EE's "ee" frame in the URDF is at joint 7, so we model the pen as a
         # 10 cm virtual extension since there's no gripper.
         self.declare_parameter('pen_offset_mm',          500.0)
+        # The pen length (mm) the begin pose was tuned for — defines the table
+        # height. When the live pen_offset_mm differs (a longer/shorter pen),
+        # the begin pose's EE is raised/lowered by the difference so the pen TIP
+        # stays on the same table (otherwise the pen length cancels out and has
+        # no effect on the motion). See the z-adjust in _cb_drawing.
+        self.declare_parameter('pen_offset_ref_mm',      100.0)
         # Which EE-local axis the pen extends along. Default (0,0,1) means
         # "pen sticks out along EE +Z". For URDFs where the tool axis is
         # along +X (common with SolidWorks-imported arms), set this to
@@ -262,6 +268,7 @@ class DrawingBatchPlanner(Node):
         gp = lambda n: self.get_parameter(n).value
         self.begin_draw_joints = np.array(gp('begin_draw_joints'), dtype=float)
         self.pen_offset_m      = float(gp('pen_offset_mm')) / 1000.0
+        self.pen_offset_ref_m  = float(gp('pen_offset_ref_mm')) / 1000.0
         self.pen_axis_local    = np.array(gp('pen_axis_local'), dtype=float)
         self.pen_axis_local   /= np.linalg.norm(self.pen_axis_local)
         self.t_move_to_begin   = float(gp('move_to_begin_seconds'))
@@ -457,6 +464,11 @@ class DrawingBatchPlanner(Node):
             self.lift_mm = max(0.0, float(cfg['lift_mm']))
         if 'z_paper_offset_mm' in cfg:
             self.z_paper_offset_mm = max(0.0, float(cfg['z_paper_offset_mm']))
+        if 'pen_offset_mm' in cfg:
+            # EE flange → pen tip length (mm). Lets the pendant switch pens of
+            # different lengths. Changing it shifts the pen tip (and hence the
+            # paper plane), so the begin pose may need re-tuning for the new pen.
+            self.pen_offset_m = max(0.0, float(cfg['pen_offset_mm'])) / 1000.0
 
         strokes = data.get('strokes', [])
         if not strokes or all(not s.get('points') for s in strokes):
@@ -480,9 +492,42 @@ class DrawingBatchPlanner(Node):
 
         _, T_begin = self._chain.fk(q_begin)
         R_begin = T_begin[:3, :3]
+        # Pin the paper to a fixed table point: the begin pose was tuned for
+        # `pen_offset_ref_m`, whose pen tip sits at `ref_tip` (the table). If the
+        # live pen is longer/shorter, re-solve the begin pose so the ACTUAL pen
+        # tip lands at the SAME table point — i.e. a longer pen raises the EE.
+        # Without this the pen length cancels out (paper is anchored to the tip)
+        # and changing pen_offset_mm has NO effect on the motion. Uses the same
+        # pen-tip IK as drawing (position-primary, robust), seeded at q_begin.
+        if abs(self.pen_offset_m - self.pen_offset_ref_m) > 1e-4:
+            pen_dir_ref = R_begin @ self.pen_axis_local
+            ref_tip = T_begin[:3, 3] + self.pen_offset_ref_m * pen_dir_ref
+            tool_off = self.pen_offset_m * self.pen_axis_local
+            q_adj, _r, _tilt, _c = solve_ik_tip(
+                self._chain, ref_tip, R_begin, tool_off, q_begin,
+                params={'dq_max': 0.05, 'max_iters': 2000, 'tol_pos': 1e-3,
+                        'joint_weights': self.joint_weights, 'null_k': 0.0})
+            if _c:
+                q_begin = q_adj
+                _, T_begin = self._chain.fk(q_begin)
+                R_begin = T_begin[:3, :3]
+                self.get_logger().info(
+                    f'pen-offset z-adjust: pen {self.pen_offset_m*1000:.0f} mm '
+                    f'(ref {self.pen_offset_ref_m*1000:.0f}) — begin EE z='
+                    f'{T_begin[2,3]*1000:.0f} mm, tip pinned to table')
+            else:
+                self.get_logger().warn(
+                    f'pen-offset z-adjust IK failed (pen '
+                    f'{self.pen_offset_m*1000:.0f} mm, err {_r*1000:.1f} mm) — '
+                    f'pen length out of reach; using base begin pose')
         # Pen extends from EE along `pen_axis_local` in the EE local frame.
         pen_dir_base     = R_begin @ self.pen_axis_local
         pen_tip_at_begin = T_begin[:3, 3] + self.pen_offset_m * pen_dir_base
+        # Keep the live-pen-position broadcast anchor in sync with the pen
+        # offset used for THIS drawing — otherwise /pen_canvas_norm is
+        # normalised against the startup (launch-default) anchor and the dot
+        # drifts whenever pen_offset_mm is changed from the pendant.
+        self._pen_anchor_base = pen_tip_at_begin
 
         # Paper plane is HORIZONTAL in base frame — drawing happens at
         # constant base z = T_begin.z, lift moves the EE up in base +Z.
@@ -563,16 +608,32 @@ class DrawingBatchPlanner(Node):
         traj.points.append(pt_start)
         point_kinds.append('start')
 
+        # Begin/dwell as a pen-UP HOVER at the lift height above the paper
+        # origin (matching the end-of-drawing lift pose) instead of resting the
+        # pen on the paper at the start. The paper plane and the per-waypoint IK
+        # seed stay = q_begin; only the held pose is raised by the lift height.
+        hover_tip = pen_tip_at_begin + paper_R @ np.array([0.0, 0.0, self.z_lift / 1000.0])
+        tool_off_hover = self.pen_offset_m * self.pen_axis_local
+        q_hover, _hr, _ht, _hc = solve_ik_tip(
+            self._chain, hover_tip, R_begin, tool_off_hover, q_begin,
+            params={'dq_max': 0.05, 'max_iters': 2000, 'tol_pos': 1e-3,
+                    'joint_weights': self.joint_weights, 'null_k': 0.0})
+        if not _hc:
+            self.get_logger().warn(
+                f'begin-hover IK failed (err {_hr*1000:.1f} mm) — '
+                f'holding at the paper instead')
+            q_hover = q_begin
+
         pt_begin = JointTrajectoryPoint()
-        pt_begin.positions = q_begin.tolist()
+        pt_begin.positions = q_hover.tolist()
         pt_begin.time_from_start = self._seconds_to_duration(self.t_move_to_begin)
         traj.points.append(pt_begin)
         point_kinds.append('begin_draw')
 
-        # Phase 2: hold at begin_draw for dwell_seconds.
+        # Phase 2: hold at the hover pose for dwell_seconds.
         t_drawing_start = self.t_move_to_begin + self.t_dwell
         pt_hold = JointTrajectoryPoint()
-        pt_hold.positions = q_begin.tolist()
+        pt_hold.positions = q_hover.tolist()
         pt_hold.time_from_start = self._seconds_to_duration(t_drawing_start)
         traj.points.append(pt_hold)
         point_kinds.append('hold')

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 import glob
 import signal
 import subprocess
@@ -136,6 +137,12 @@ class PendantBridge(Node):
         self._estopped = False
         self._killed_procs: list = []   # (argv, cwd) of nodes killed by E-stop, for RESET
         self._last_drawing: str | None = None
+        # Drawing-progress tracking for the Home/Stop toggle button. Set when a
+        # drawing is sent; the actual end time is refined from the planner's
+        # trajectory (its last point's time_from_start). is_drawing() reads this.
+        self._drawing_active = False
+        self._expecting_drawing = False
+        self._drawing_end = 0.0          # time.monotonic() deadline
         # Internal Cartesian-jog target. Advances only while the robot keeps up;
         # if it falls behind (workspace edge / unreachable) the target re-anchors
         # to the actual pose so the joystick can't push it out of reach.
@@ -152,6 +159,9 @@ class PendantBridge(Node):
 
         self._pen_cb = None
         self.create_subscription(Point, "/pen_canvas_norm", self._cb_pen, 30)
+        # Watch the planner's drawing trajectory to learn its real duration.
+        self.create_subscription(
+            JointTrajectory, "/arm_controller/joint_trajectory", self._cb_traj, 10)
 
         self.get_logger().info("pendant7dof bridge ready")
 
@@ -169,6 +179,39 @@ class PendantBridge(Node):
     def _cb_pen(self, msg: Point) -> None:
         if self._pen_cb is not None:
             self._pen_cb(float(msg.x), float(msg.y), float(msg.z))
+
+    def _cb_traj(self, msg: JointTrajectory) -> None:
+        # Refine the drawing deadline from the planner's trajectory. Only the
+        # multi-point drawing trajectory counts (the bridge's own presets/freeze
+        # are single-point); gated on _expecting_drawing so a later jog can't
+        # re-trigger it.
+        if not self._expecting_drawing or len(msg.points) <= 3:
+            return
+        d = msg.points[-1].time_from_start
+        dur = d.sec + d.nanosec * 1e-9
+        self._drawing_end = time.monotonic() + dur + 1.0   # +1s settle margin
+        self._expecting_drawing = False
+        self.get_logger().info(f"drawing trajectory: {dur:.1f} s")
+
+    def is_drawing(self) -> bool:
+        """True while a sent drawing is still executing (drives the Home/Stop
+        button). Auto-clears once the trajectory deadline passes."""
+        if self._estopped:
+            self._drawing_active = False
+            return False
+        if not self._drawing_active:
+            return False
+        if time.monotonic() >= self._drawing_end:
+            self._drawing_active = False
+            return False
+        return True
+
+    def stop_drawing(self) -> None:
+        """Drawing-tab 'Stop' (the Home button while drawing): halt the robot
+        where it is and clear the drawing state so the button reverts to Home."""
+        self._drawing_active = False
+        self._expecting_drawing = False
+        self.freeze()
 
     def attach_pen_callback(self, cb) -> None:
         self._pen_cb = cb
@@ -501,6 +544,12 @@ class PendantBridge(Node):
         msg.data = json.dumps(strokes_dict)
         self.strokes_pub.publish(msg)
         self._last_drawing = msg.data
+        # Mark drawing active so the Home button shows "Stop". The real deadline
+        # is refined in _cb_traj when the planner's trajectory arrives; until
+        # then use a generous safety cap so the button can't get stuck on "Stop".
+        self._drawing_active = True
+        self._expecting_drawing = True
+        self._drawing_end = time.monotonic() + 90.0
         n = len(strokes_dict.get("strokes", []))
         self.get_logger().info(f"published drawing: {n} strokes")
 

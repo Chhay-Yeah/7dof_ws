@@ -71,7 +71,7 @@ class CanvasView(QGraphicsView):
         else:
             self.pen_dot.setVisible(False)
 
-    def set_pen_pos(self, norm_x: float, norm_y: float, _z_mm: float) -> None:
+    def set_pen_pos(self, norm_x: float, norm_y: float, z_mm: float) -> None:
         if not (0.0 <= norm_x <= 1.0 and 0.0 <= norm_y <= 1.0):
             self._pen_last_pos = None
             if self.pen_dot is not None:
@@ -82,6 +82,14 @@ class CanvasView(QGraphicsView):
         self._pen_last_pos = (x_px, y_px)
         self.pen_dot.setPos(x_px, y_px)
         self.pen_dot.setVisible(True)
+        # z_mm is the pen tip's height above the paper (mm): ~0 while drawing,
+        # = the lift height during pen-up travel/approach. Fade the dot when the
+        # pen is lifted so it only reads as a solid mark while actually drawing
+        # (the begin pose maps to the canvas centre, so a solid dot would
+        # otherwise "dip" to the middle during every move-to-begin / travel).
+        lifted = z_mm > 2.0
+        alpha = 70 if lifted else 255
+        self.pen_dot.setBrush(QBrush(QColor(135, 206, 235, alpha)))
 
     # ── rendering helpers ─────────────────────────────────────────────────
     @staticmethod

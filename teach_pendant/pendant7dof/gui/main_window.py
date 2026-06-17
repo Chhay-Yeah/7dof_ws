@@ -35,19 +35,22 @@ from .drawing_canvas import (
 )
 from .joystick import Joystick
 
-# Per-axis canvas caps. Default canvas is a 100×100 square (the largest square the
-# pen-down drawable band allows — it's ~100 mm deep × ~250 mm wide). X (width) can
-# be widened toward the band's width if a landscape area is wanted; Y (depth) is
-# the binding limit (~100 mm), capped just above it. Beyond these the planner
-# clamps/warns. (See pendant_backend canvas_anchor + drawing_batch_planner.)
-MAX_WORKSPACE_X_MM = 240.0
-MAX_WORKSPACE_Y_MM = 110.0
+# Canvas is a fixed 100×100 square (the largest square the pen-down drawable band
+# allows at the current begin pose). Size is no longer user-adjustable — only pen
+# lift and pen-tip offset remain. (See pendant_backend + drawing_batch_planner.)
 # Pen lift: the value sent to the planner is the spinbox value PLUS this
 # baseline, and the spinbox default reads 0 — i.e. "0" on screen = a 50 mm
 # real pen-up lift. Lets the user trim around a safe baseline.
 LIFT_BASELINE_MM = 50.0
 DEFAULT_LIFT_MM = 50.0   # actual lift sent by default (shown as 0)
 DEFAULT_Z_PAPER_OFFSET_MM = 0.0
+# Pen-tip offset: distance from the EE flange to the pen tip (mm). Adjustable so
+# the robot can swap pencil/marker/pen of different lengths. Kept at the current
+# backend value (100) to preserve calibration; the true pen is 157 mm — set that
+# once the begin pose is recentred for the matching paper height (separate step).
+DEFAULT_PEN_OFFSET_MM = 100.0
+MIN_PEN_OFFSET_MM = 20.0
+MAX_PEN_OFFSET_MM = 400.0
 
 # Per-tick jog scale at the joystick rate (full stick deflection).
 JOINT_STEP_PER_TICK = 0.012   # rad
@@ -95,6 +98,13 @@ _DRAW_BTN_QSS = (
     " border-radius: 7px; color: white; padding: 8px 18px; }"
     "QPushButton:hover { background: #454b54; border-color: #8a93a0; }"
     "QPushButton:pressed { background: #2e333a; }"
+)
+# Red variant for the Home button while it acts as "Stop" (robot drawing).
+_DRAW_STOP_BTN_QSS = (
+    "QPushButton { background: #a33; border: 1px solid #e66;"
+    " border-radius: 7px; color: white; padding: 8px 18px; }"
+    "QPushButton:hover { background: #b44; border-color: #f88; }"
+    "QPushButton:pressed { background: #822; }"
 )
 
 
@@ -795,10 +805,12 @@ class MainWindow(QMainWindow):
         self.resize(1100, 700)
 
         self._draw_cfg = {
+            # Canvas size is FIXED (matched to the robot's drawable area) — no
+            # longer user-adjustable. Only pen lift and pen-tip offset remain.
             "workspace_x_mm": DEFAULT_WORKSPACE_X_MM,
             "workspace_y_mm": DEFAULT_WORKSPACE_Y_MM,
             "lift_mm": DEFAULT_LIFT_MM,          # actual lift (mm) sent to planner
-            "z_paper_offset_mm": DEFAULT_Z_PAPER_OFFSET_MM,
+            "pen_offset_mm": DEFAULT_PEN_OFFSET_MM,  # EE flange → pen tip length
         }
         self._history: list[int] = []
         self._hist_idx = -1
@@ -1864,8 +1876,6 @@ class MainWindow(QMainWindow):
 
         cfg_box = QGroupBox("Drawing settings")
         form = QGridLayout(cfg_box)
-        self.ws_x_spin = self._mm_spin(20.0, MAX_WORKSPACE_X_MM, self._draw_cfg["workspace_x_mm"])
-        self.ws_y_spin = self._mm_spin(20.0, MAX_WORKSPACE_Y_MM, self._draw_cfg["workspace_y_mm"])
         # Lift spin shows the value RELATIVE to the 50 mm baseline: 0 = 50 mm
         # real lift. Stored cfg lift_mm is the actual value (display + baseline).
         # Range is wide-open (the adjustment is uncapped): display down to the
@@ -1879,24 +1889,28 @@ class MainWindow(QMainWindow):
                                   f"positive raises it. Adjustment is uncapped; "
                                   f"very high lift can put canvas corners out of "
                                   f"reach at the pen-up height.")
-        self.zpaper_spin = self._mm_spin(0.0, 30.0, self._draw_cfg["z_paper_offset_mm"])
-        form.addWidget(QLabel("Workspace X (mm)"), 0, 0)
-        form.addWidget(self.ws_x_spin, 0, 1)
-        form.addWidget(QLabel("Workspace Y (mm)"), 1, 0)
-        form.addWidget(self.ws_y_spin, 1, 1)
-        form.addWidget(QLabel("Pen lift (mm)"), 2, 0)
-        form.addWidget(self.lift_spin, 2, 1)
-        form.addWidget(QLabel("Z-paper offset (mm)"), 3, 0)
-        form.addWidget(self.zpaper_spin, 3, 1)
+        # Pen-tip offset: EE flange → pen tip length (mm). Change when swapping
+        # the pen/marker/pencil for one of a different length.
+        self.pen_off_spin = self._mm_spin(MIN_PEN_OFFSET_MM, MAX_PEN_OFFSET_MM,
+                                          self._draw_cfg["pen_offset_mm"])
+        self.pen_off_spin.setToolTip("Distance from the end-effector flange to "
+                                     "the pen tip (mm). Set this to the length of "
+                                     "the pen/marker/pencil currently mounted. "
+                                     "Changing it shifts the paper plane, so the "
+                                     "begin pose may need re-tuning.")
+        form.addWidget(QLabel("Pen lift (mm)"), 0, 0)
+        form.addWidget(self.lift_spin, 0, 1)
+        form.addWidget(QLabel("Pen tip offset (mm)"), 1, 0)
+        form.addWidget(self.pen_off_spin, 1, 1)
         apply_btn = QPushButton("Apply")
         apply_btn.setStyleSheet(_DRAW_BTN_QSS)
         apply_btn.clicked.connect(self._apply_draw_cfg)
-        form.addWidget(apply_btn, 4, 0, 1, 2)
+        form.addWidget(apply_btn, 2, 0, 1, 2)
         col.addWidget(cfg_box)
 
         warn = QLabel(
-            f"Workspace capped to {int(MAX_WORKSPACE_X_MM)}×{int(MAX_WORKSPACE_Y_MM)} mm "
-            "(IK-reachable drawable area). Applying new settings sends the robot Home."
+            "Canvas size is fixed to the robot's drawable area. Applying new "
+            "settings sends the robot Home."
         )
         warn.setWordWrap(True)
         warn.setStyleSheet("color: #a60; font-size: 11px;")
@@ -1906,13 +1920,18 @@ class MainWindow(QMainWindow):
         for i, (label, cb) in enumerate((
             ("Send", lambda: self.node.send_drawing(self._drawing_message())),
             ("Clear", self.canvas.clear),
-            ("Reset", self.node.stop_and_home),   # stop the robot, then move Home
-            ("Home", lambda: self.node.goto_preset("Home")),
+            # While a drawing is executing this button reads "Stop" and halts the
+            # robot; otherwise it reads "Home" and parks it. _refresh_status swaps
+            # the label/colour; the handler picks the action by current state.
+            ("Home", self._on_draw_home_or_stop),
         )):
             b = QPushButton(label)
             b.setStyleSheet(_DRAW_BTN_QSS)
             b.clicked.connect(cb)
             actions.addWidget(b, i // 2, i % 2)
+            if label == "Home":
+                self.draw_home_btn = b
+                self._draw_btn_is_stop = False
         col.addLayout(actions)
 
         col.addStretch(1)
@@ -1929,21 +1948,25 @@ class MainWindow(QMainWindow):
         return s
 
     def _apply_draw_cfg(self) -> None:
-        self._draw_cfg["workspace_x_mm"] = self.ws_x_spin.value()
-        self._draw_cfg["workspace_y_mm"] = self.ws_y_spin.value()
+        # Canvas size is fixed; only pen lift and pen-tip offset are adjustable.
         self._draw_cfg["lift_mm"] = self.lift_spin.value() + LIFT_BASELINE_MM
-        self._draw_cfg["z_paper_offset_mm"] = self.zpaper_spin.value()
-        self.canvas.set_workspace(self._draw_cfg["workspace_x_mm"],
-                                  self._draw_cfg["workspace_y_mm"])
+        self._draw_cfg["pen_offset_mm"] = self.pen_off_spin.value()
         # New settings shift the drawing frame, so park at Home first.
         self.node.goto_preset("Home")
 
     def _drawing_message(self) -> dict:
         self._draw_cfg["lift_mm"] = self.lift_spin.value() + LIFT_BASELINE_MM
-        self._draw_cfg["z_paper_offset_mm"] = self.zpaper_spin.value()
+        self._draw_cfg["pen_offset_mm"] = self.pen_off_spin.value()
         msg = self.canvas.get_drawing()
         msg["config"] = dict(self._draw_cfg)
         return msg
+
+    def _on_draw_home_or_stop(self) -> None:
+        """Drawing-tab button: 'Stop' (halt) while a drawing runs, else 'Home'."""
+        if self.node.is_drawing():
+            self.node.stop_drawing()
+        else:
+            self.node.goto_preset("Home")
 
     # ── settings page ──────────────────────────────────────────────────────
     def _build_settings_tab(self) -> QWidget:
@@ -2021,6 +2044,15 @@ class MainWindow(QMainWindow):
 
         self.status_joint_label.setText("joints: " + jtxt)
         self.status_ee_label.setText(ee_txt)
+
+        # Drawing-tab Home button doubles as Stop while a drawing executes.
+        btn = getattr(self, "draw_home_btn", None)
+        if btn is not None:
+            drawing = self.node.is_drawing()
+            if drawing != self._draw_btn_is_stop:   # only restyle on change
+                btn.setText("Stop" if drawing else "Home")
+                btn.setStyleSheet(_DRAW_STOP_BTN_QSS if drawing else _DRAW_BTN_QSS)
+                self._draw_btn_is_stop = drawing
         for lbl, name, q in zip(self.joint_info_labels, JOINT_NAMES, joints):
             lbl.setText(f"{name} = {q:+.3f}")
         self.ee_info_label.setText(ee_txt)
