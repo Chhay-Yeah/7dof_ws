@@ -210,7 +210,10 @@ def generate_launch_description():
             # path ("all over the place"). This lower pose draws far-and-low,
             # which is flip-free (jumps ≤0.26 rad).
             "begin_draw_joints": [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0],
-            "pen_offset_mm": 100.0,
+            # Value the planner USES (tip lands on the paper in sim). The GUI
+            # shows the real pen length (157 mm) and subtracts the 36 mm
+            # sim-vs-real calibration delta before sending → 121.
+            "pen_offset_mm": 121.0,
             "pen_axis_local": [1.0, 0.0, 0.0],
             # Gentle approach to the drawing: ease the move into the begin pose
             # and (especially) the pen descent onto the paper. approach_seconds
@@ -220,6 +223,16 @@ def generate_launch_description():
             "move_to_begin_seconds": 6.0,
             "approach_seconds": 3.0,
             "dwell_seconds": 3.0,
+            # Pen-down hold at each stroke's start and end: after the pen touches
+            # down it waits this long before dragging, and waits again at the
+            # stroke end before lifting (zero-motion holds → the arm fully stops).
+            "stroke_dwell_seconds": 2.0,
+            # Sharp corners: split the per-stroke spline at vertices whose turn
+            # angle exceeds this (deg) so rectangles etc. keep crisp corners
+            # instead of rounded arcs. corner_dwell_seconds optionally holds at
+            # each corner for an extra-hard stop (0 = geometry split only).
+            "corner_angle_deg": 40.0,
+            "corner_dwell_seconds": 1.0,
             # Tilt-capable drawing: pen-tip task-priority IK (perpendicular in
             # the middle, tilts only near the edges). This expands the verified
             # IK-reachable drawable area from a ~40 mm square to a 240×100 mm
@@ -242,14 +255,23 @@ def generate_launch_description():
             "canvas_anchor_x_mm": 10.0,
             "canvas_anchor_y_mm": 18.0,
             "tilt_max_deg": 30.0,
-            # Pen-up lift baseline (the GUI shows this as 0 and trims around it).
-            "lift_mm": 50.0,
+            # Pen-up travel clearance, signed (negative = up): -25 = 25 mm above
+            # the paper. Floored at 10 mm clearance in the planner; the GUI shows
+            # the positive clearance (25).
+            "lift_mm": -25.0,
             "log_joint_deltas": True,
             "locked_joints": [-1],
             "null_k": 2.0,
             "joint_weights": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0],
             "paper_rotation_deg": 270,
             "paper_mirror_x": False,
+            # Table-tilt compensation (deg) if the table isn't parallel to the
+            # robot base. 0/0 = horizontal drawing plane. Calibrate live: touch
+            # the table at a couple of points, set the slope, flip sign if the
+            # dip gets worse. tilt_x = rot about base +X (base-Y slope), tilt_y =
+            # rot about base +Y (base-X slope).
+            "table_tilt_x_deg": 0.0,
+            "table_tilt_y_deg": 0.0,
             "travel_speed_mm_s": 15.0,
         }],
     )

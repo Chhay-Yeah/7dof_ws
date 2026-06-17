@@ -33,7 +33,7 @@ def generate_launch_description():
                  # the drawing, so no mid-trajectory wrist rolling is needed.
                  'begin_draw_joints': [0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0],
                  # Virtual pen length beyond the EE link (no real gripper).
-                 'pen_offset_mm':         100.0,
+                 'pen_offset_mm':         121.0,
                  # This URDF's EE +X is the "along the arm" axis (verified
                  # by FK at home — see workspace_prober output where home
                  # pose has EE +X = (0, 0, +1) = base +Z). At home that's
@@ -45,6 +45,12 @@ def generate_launch_description():
                  # Pre-drawing motion timing.
                  'move_to_begin_seconds': 4.0,
                  'dwell_seconds':         3.0,
+                 # Pen-down hold at each stroke's start and end (zero-motion).
+                 'stroke_dwell_seconds':  2.0,
+                 # Sharp corners: split the spline at vertices turning more than
+                 # this (deg); corner_dwell holds there for a hard stop (0=off).
+                 'corner_angle_deg':      40.0,
+                 'corner_dwell_seconds':  1.0,
                  # Paper extents matching the prober's safe centred square
                  # under the horizontal-paper convention. Shrunk from 60 to
                  # 40 mm to keep targets well inside the reachable shell —
@@ -55,7 +61,7 @@ def generate_launch_description():
                  # lift_mm = lift distance "away from paper". The planner
                  # negates it internally because paper +Z points INTO the
                  # paper (along pen direction). Always pass a positive value.
-                 'lift_mm':               10.0,
+                 'lift_mm':               -25.0,
                  # Verbose per-waypoint joint log so you can inspect the
                  # joint motion the planner asks for. One log line per
                  # trajectory point (~20–100 per drawing). Set False to

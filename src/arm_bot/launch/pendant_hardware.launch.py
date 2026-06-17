@@ -105,9 +105,11 @@ def generate_launch_description():
         parameters=[{
             "use_sim_time": sim_time,
             "begin_draw_joints": [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0],
-            "pen_offset_mm": 100.0, "pen_axis_local": [1.0, 0.0, 0.0],
+            "pen_offset_mm": 121.0, "pen_axis_local": [1.0, 0.0, 0.0],
             "move_to_begin_seconds": 4.0, "dwell_seconds": 3.0,
-            "workspace_x_mm": 40.0, "workspace_y_mm": 40.0, "lift_mm": 0.0,
+            "stroke_dwell_seconds": 2.0,
+            "corner_angle_deg": 40.0, "corner_dwell_seconds": 1.0,
+            "workspace_x_mm": 40.0, "workspace_y_mm": 40.0, "lift_mm": -25.0,
             "log_joint_deltas": True, "locked_joints": [-1], "null_k": 2.0,
             "joint_weights": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0],
             "paper_rotation_deg": 270, "paper_mirror_x": False, "travel_speed_mm_s": 15.0,

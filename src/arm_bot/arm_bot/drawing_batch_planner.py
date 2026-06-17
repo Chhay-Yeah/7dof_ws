@@ -140,17 +140,12 @@ class DrawingBatchPlanner(Node):
         # plane extents, not absolute base-frame coords.
         self.declare_parameter('workspace_x_mm',         100.0)
         self.declare_parameter('workspace_y_mm',         100.0)
-        # Pen-up clearance. POSITIVE lifts the pen UP, away from the paper;
-        # 0 = no lift (pen stays at paper height). NEGATIVE would drive the
-        # pen below the table — that target is unreachable in the drawing
-        # posture and makes the IK flip the wrist to reach for it (looks like
-        # the arm "glancing up" mid-stroke), so don't use negative values.
-        self.declare_parameter('lift_mm',                0.0)
-        # Shifts the paper plane up/down (base +Z) from the begin-draw pen-tip
-        # height. 0 = draw at the begin pose's natural height; positive lifts
-        # the whole plane, negative presses lower. The teach-pendant Drawing
-        # settings drive this per-drawing via the message `config` block.
-        self.declare_parameter('z_paper_offset_mm',      0.0)
+        # Pen-up clearance, expressed as the tip→paper distance during travel.
+        # SIGN: negative = pen UP (away from the paper); the magnitude is the
+        # clearance in mm. So -25 means the pen rides 25 mm above the paper
+        # between strokes. The clearance is floored at 10 mm (see z_lift below)
+        # so the pen never reaches the table; there is no upper cap.
+        self.declare_parameter('lift_mm',                -25.0)
         # Safety clamp: the reachable centred drawing square. Larger boxes push
         # joint_6 (tight limits) to its stops at the corners and IK degrades,
         # so GUI-supplied workspace sizes are clamped to this.
@@ -184,6 +179,25 @@ class DrawingBatchPlanner(Node):
         self.declare_parameter('approach_seconds',       1.0)
         self.declare_parameter('approach_samples',       8)
         self.declare_parameter('initial_settle_seconds', 0.5)
+        # Pen-DOWN hold at each stroke's start and end. After the pen descends
+        # to the paper at the stroke start it holds here this many seconds before
+        # dragging; after the stroke finishes it holds again before lifting.
+        # 0 disables (no hold). Implemented as zero-motion waypoints, so the arm
+        # fully stops (zero velocity) during the hold.
+        self.declare_parameter('stroke_dwell_seconds',   2.0)
+        # Sharp-corner handling. A single cubic spline through a whole stroke
+        # rounds genuine corners (e.g. a rectangle's 90° turns) into smooth
+        # arcs. Vertices whose turn angle (deviation from straight) exceeds this
+        # are treated as corners: the spline is SPLIT there so each corner stays
+        # an exact vertex with near-straight approaches. 0 disables (smooth the
+        # whole stroke — the old behaviour).
+        self.declare_parameter('corner_angle_deg',       40.0)
+        # Pen-down hold (s) at each detected corner. With velocity feedforward
+        # off the controller blends through the vertex (rounding it); this
+        # zero-motion hold makes the arm fully stop and settle so the corner is
+        # crisp. Long enough (~1 s) that the controller decelerates to rest at
+        # the exact vertex before turning. 0 = geometry split only (softer).
+        self.declare_parameter('corner_dwell_seconds',   1.0)
         # Canvas → paper plane rotation, one of {0, 90, 180, 270}. Apply
         # around base +Z. 0 = canvas X to base X, canvas Y to base Y.
         # 90 / -90 swap them; 180 just reverses traversal direction (for
@@ -195,6 +209,18 @@ class DrawingBatchPlanner(Node):
         # (8 total). Use this if rotating alone never matches what you
         # see on the canvas (i.e. you need a reflection, not a rotation).
         self.declare_parameter('paper_mirror_x',         False)
+        # Table-tilt compensation. The drawing plane is otherwise perfectly
+        # horizontal in the robot base frame (paper_R z-axis = base +Z). If the
+        # real table is not parallel to the base XY plane, the pen digs in on the
+        # high side and lifts on the low side. These tilt the drawing plane to
+        # match the table so the pen tip keeps constant contact across the canvas:
+        #   table_tilt_x_deg = rotation about base +X (compensates a base-Y slope)
+        #   table_tilt_y_deg = rotation about base +Y (compensates a base-X slope)
+        # 0/0 = horizontal (today's behaviour). Calibrate by touching the table at
+        # a couple of points (see drawing_batch_planner docstring / the chat) and
+        # flip the sign if it makes the dip worse.
+        self.declare_parameter('table_tilt_x_deg',       0.0)
+        self.declare_parameter('table_tilt_y_deg',       0.0)
 
         # ── Kinematics ─────────────────────────────────────────────────────
         self.declare_parameter('base_link', 'base_link')
@@ -275,7 +301,6 @@ class DrawingBatchPlanner(Node):
         self.t_dwell           = float(gp('dwell_seconds'))
         self.wx, self.wy       = gp('workspace_x_mm'), gp('workspace_y_mm')
         self.lift_mm           = float(gp('lift_mm'))
-        self.z_paper_offset_mm = float(gp('z_paper_offset_mm'))
         self.max_workspace_mm  = float(gp('max_workspace_mm'))
         self.draw_tilt         = bool(gp('draw_tilt'))
         self.anchor_x_m        = float(gp('canvas_anchor_x_mm')) / 1000.0
@@ -292,6 +317,9 @@ class DrawingBatchPlanner(Node):
         self.t_approach        = float(gp('approach_seconds'))
         self.n_approach        = int(gp('approach_samples'))
         self.t_settle          = float(gp('initial_settle_seconds'))
+        self.t_stroke_dwell    = max(0.0, float(gp('stroke_dwell_seconds')))
+        self.corner_angle_deg  = float(gp('corner_angle_deg'))
+        self.t_corner_dwell    = max(0.0, float(gp('corner_dwell_seconds')))
         self.base_link         = gp('base_link')
         self.tip_link          = gp('tip_link')
         self.frame_id          = gp('frame_id')
@@ -302,6 +330,8 @@ class DrawingBatchPlanner(Node):
         self.joint_weights     = [float(w) for w in gp('joint_weights')]
         self.paper_rotation_deg = int(gp('paper_rotation_deg'))
         self.paper_mirror_x    = bool(gp('paper_mirror_x'))
+        self.table_tilt_x_deg  = float(gp('table_tilt_x_deg'))
+        self.table_tilt_y_deg  = float(gp('table_tilt_y_deg'))
         self.velocity_ff       = bool(gp('velocity_ff'))
         self.max_joint_speed   = float(gp('max_joint_speed'))
 
@@ -381,7 +411,7 @@ class DrawingBatchPlanner(Node):
             theta = np.radians(self.paper_rotation_deg)
             c, s = float(np.cos(theta)), float(np.sin(theta))
             sx = -1.0 if self.paper_mirror_x else 1.0
-            self._paper_R_persistent = np.array([
+            self._paper_R_persistent = self._table_tilt_R() @ np.array([
                 [c * sx, -s,  0.0],
                 [s * sx,  c,  0.0],
                 [0.0,     0.0, 1.0],
@@ -459,11 +489,9 @@ class DrawingBatchPlanner(Node):
         if 'workspace_y_mm' in cfg:
             self.wy = min(float(cfg['workspace_y_mm']), self.max_workspace_mm)
         if 'lift_mm' in cfg:
-            # Negative lift/offset drives the pen below the table — unreachable
-            # in the drawing posture and makes the IK flip the wrist mid-stroke.
-            self.lift_mm = max(0.0, float(cfg['lift_mm']))
-        if 'z_paper_offset_mm' in cfg:
-            self.z_paper_offset_mm = max(0.0, float(cfg['z_paper_offset_mm']))
+            # Signed clearance (negative = up). The 10 mm floor is applied when
+            # z_lift is computed, so just store the raw value here.
+            self.lift_mm = float(cfg['lift_mm'])
         if 'pen_offset_mm' in cfg:
             # EE flange → pen tip length (mm). Lets the pendant switch pens of
             # different lengths. Changing it shifts the pen tip (and hence the
@@ -550,6 +578,10 @@ class DrawingBatchPlanner(Node):
             [s * sx,  c,  0.0],
             [0.0,     0.0, 1.0],
         ])
+        # Tilt the (base-horizontal) drawing plane to match a non-level table so
+        # the pen keeps constant contact across the canvas. Identity when the
+        # table_tilt params are 0.
+        paper_R = self._table_tilt_R() @ paper_R
 
         # Paper frame is anchored at T_begin.t with axes = EE local axes at
         # begin_draw (paper_R = R_begin). So paper +Z = pen direction (into
@@ -562,8 +594,13 @@ class DrawingBatchPlanner(Node):
         # = identity → paper +Z = base +Z = away from horizontal paper.
         self.ox      = -self.wx / 2.0
         self.oy      = -self.wy / 2.0
-        self.z_paper = self.z_paper_offset_mm
-        self.z_lift  = self.z_paper_offset_mm + self.lift_mm
+        # Paper plane sits at the begin-pose pen-tip height (z_paper = 0 in the
+        # paper frame); the pen lifts to z_lift above it between strokes. lift_mm
+        # is the signed clearance (negative = up); z_lift is the positive travel
+        # height, floored at 10 mm so the tip never reaches the table and uncapped
+        # above.
+        self.z_paper = 0.0
+        self.z_lift  = max(10.0, -self.lift_mm)
         # Orientation stays = R_begin throughout. q_draw/q_approach are
         # kept identical so the SLERP in the approach/lift loops is a
         # no-op (orientation already correct from the joint-space move
@@ -958,6 +995,70 @@ class DrawingBatchPlanner(Node):
             prev_q = q
         self.get_logger().info('--- end trajectory dump ---')
 
+    def _table_tilt_R(self):
+        """Base-frame rotation that tilts the otherwise-horizontal drawing plane
+        to match a non-level table: Rx(table_tilt_x) @ Ry(table_tilt_y). Identity
+        when both tilts are 0 (the default)."""
+        tx = np.radians(self.table_tilt_x_deg)
+        ty = np.radians(self.table_tilt_y_deg)
+        cx, sxx = float(np.cos(tx)), float(np.sin(tx))
+        cy, syy = float(np.cos(ty)), float(np.sin(ty))
+        Rx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sxx], [0.0, sxx, cx]])
+        Ry = np.array([[cy, 0.0, syy], [0.0, 1.0, 0.0], [-syy, 0.0, cy]])
+        return Rx @ Ry
+
+    def _detect_corners(self, xs, ys):
+        """Indices of sharp-corner vertices in a polyline (mm coords).
+
+        A vertex is a corner when the turn angle (deviation from straight)
+        between its incoming and outgoing chord exceeds corner_angle_deg.
+        Sub-millimetre jitter segments are ignored so noisy freehand curves
+        don't register false corners. Returns a sorted list of interior
+        indices (empty if corner splitting is disabled or the stroke is short).
+        """
+        n = len(xs)
+        if n < 3 or self.corner_angle_deg <= 0.0:
+            return []
+        thr = np.radians(self.corner_angle_deg)
+        min_seg = 1.0  # mm — ignore jitter shorter than this on either side
+        corners = []
+        for i in range(1, n - 1):
+            v1x, v1y = xs[i] - xs[i - 1], ys[i] - ys[i - 1]
+            v2x, v2y = xs[i + 1] - xs[i], ys[i + 1] - ys[i]
+            n1 = float(np.hypot(v1x, v1y))
+            n2 = float(np.hypot(v2x, v2y))
+            if n1 < min_seg or n2 < min_seg:
+                continue
+            cosang = (v1x * v2x + v1y * v2y) / (n1 * n2)
+            turn = float(np.arccos(np.clip(cosang, -1.0, 1.0)))
+            if turn > thr:
+                corners.append(i)
+        return corners
+
+    def _resample_segment(self, xs, ys):
+        """Resample one polyline segment at uniform chord spacing (ds_mm).
+
+        Cubic spline for >=4 points (smooth curves), linear otherwise. Returns
+        (xs_s, ys_s). The original endpoints are preserved exactly, so splitting
+        a stroke here and stitching segments keeps corners sharp.
+        """
+        if len(xs) < 2:
+            return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+        dx = np.diff(xs)
+        dy = np.diff(ys)
+        seg = np.hypot(dx, dy)
+        u = np.concatenate(([0.0], np.cumsum(seg)))
+        L = float(u[-1])
+        if L < 1e-6:
+            return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+        n_samples = max(2, int(round(L / self.ds_mm)) + 1)
+        u_new = np.linspace(0.0, L, n_samples)
+        if len(xs) >= 4:
+            cs_x = CubicSpline(u, xs, bc_type='natural')
+            cs_y = CubicSpline(u, ys, bc_type='natural')
+            return cs_x(u_new), cs_y(u_new)
+        return np.interp(u_new, u, xs), np.interp(u_new, u, ys)
+
     def _build_cartesian_waypoints(self, data):
         """Returns a list of (x_m, y_m, z_m, q_wxyz, dt_s, kind) tuples.
 
@@ -986,31 +1087,37 @@ class DrawingBatchPlanner(Node):
                 if (xs[i] - xs[keep[-1]])**2 + (ys[i] - ys[keep[-1]])**2 > 1e-8:
                     keep.append(i)
             xs, ys = xs[keep], ys[keep]
+
+            # Corner-aware resampling. A single cubic spline through the whole
+            # stroke rounds genuine corners (a rectangle's 90° turns) into arcs.
+            # Split the stroke at detected sharp corners and resample each
+            # near-straight/curved segment INDEPENDENTLY, keeping the corner as
+            # an exact shared vertex. corner_set holds indices into xs_s/ys_s
+            # that are corner vertices (used to optionally hold there for a crisp
+            # stop). With corner_angle_deg=0 (or no corners) this collapses to a
+            # single segment = the original whole-stroke spline.
+            corner_set: set[int] = set()
             if len(xs) < 2:
                 xs_s, ys_s = xs.copy(), ys.copy()
             else:
-                # Cumulative chord length parameter
-                dx = np.diff(xs)
-                dy = np.diff(ys)
-                seg = np.hypot(dx, dy)
-                u = np.concatenate(([0.0], np.cumsum(seg)))
-                L = float(u[-1])
-                if L < 1e-6:
-                    xs_s, ys_s = xs.copy(), ys.copy()
-                else:
-                    # Resample at uniform chord spacing (close to arc length for
-                    # smooth pen strokes).
-                    n_samples = max(2, int(round(L / self.ds_mm)) + 1)
-                    u_new = np.linspace(0.0, L, n_samples)
-                    if len(xs) >= 4:
-                        cs_x = CubicSpline(u, xs, bc_type='natural')
-                        cs_y = CubicSpline(u, ys, bc_type='natural')
-                        xs_s = cs_x(u_new)
-                        ys_s = cs_y(u_new)
-                    else:
-                        # Too few points for cubic — linear is fine
-                        xs_s = np.interp(u_new, u, xs)
-                        ys_s = np.interp(u_new, u, ys)
+                corners = self._detect_corners(xs, ys)
+                bounds = [0] + corners + [len(xs) - 1]
+                xparts, yparts = [], []
+                running = 0
+                for k in range(len(bounds) - 1):
+                    a, b = bounds[k], bounds[k + 1]
+                    rx, ry = self._resample_segment(xs[a:b + 1], ys[a:b + 1])
+                    if k > 0:
+                        rx, ry = rx[1:], ry[1:]   # drop the junction duplicate
+                    xparts.append(rx)
+                    yparts.append(ry)
+                    running += len(rx)
+                    # The vertex at the END of this segment (= bounds[k+1]) is a
+                    # corner for every segment but the last.
+                    if k < len(bounds) - 2 and len(rx) > 0:
+                        corner_set.add(running - 1)
+                xs_s = np.concatenate(xparts) if xparts else xs.copy()
+                ys_s = np.concatenate(yparts) if yparts else ys.copy()
 
             # Clamp resampled points to the canvas box: a cubic spline through
             # sharp corners can overshoot past the edges, pushing waypoints
@@ -1060,6 +1167,20 @@ class DrawingBatchPlanner(Node):
                     'approach',
                 ))
 
+            # 2b. Pen-down hold at the stroke start: the pen is now on the paper
+            #     at (x0, y0); hold here before dragging so the start dot is
+            #     clean and the user can see the pen settle. Zero-motion waypoint
+            #     (same pose) → the arm stops fully during the hold.
+            if self.t_stroke_dwell > 0.0:
+                wps.append((
+                    x0_mm / 1000.0,
+                    y0_mm / 1000.0,
+                    self.z_paper / 1000.0,
+                    self.q_draw,
+                    self.t_stroke_dwell,
+                    'dwell',
+                ))
+
             # 3. Draw the stroke at z_paper with constant orientation
             #    First point is the touch-down (already at z_paper, q_draw).
             #    Time per sample = chord_dist / v_draw.
@@ -1075,6 +1196,28 @@ class DrawingBatchPlanner(Node):
                     self.q_draw,
                     max(dt, 1e-3),
                     'draw',
+                ))
+                # Optional crisp-stop hold AT the corner vertex (zero-motion).
+                if i in corner_set and self.t_corner_dwell > 0.0:
+                    wps.append((
+                        float(xs_s[i]) / 1000.0,
+                        float(ys_s[i]) / 1000.0,
+                        self.z_paper   / 1000.0,
+                        self.q_draw,
+                        self.t_corner_dwell,
+                        'corner',
+                    ))
+
+            # 3b. Pen-down hold at the stroke end: the pen is still on the paper
+            #     at (xN, yN); hold here before lifting (mirrors the start hold).
+            if self.t_stroke_dwell > 0.0:
+                wps.append((
+                    xN_mm / 1000.0,
+                    yN_mm / 1000.0,
+                    self.z_paper / 1000.0,
+                    self.q_draw,
+                    self.t_stroke_dwell,
+                    'dwell',
                 ))
 
             # 4. Lift: ascend z_paper → z_lift, SLERP q_draw → q_approach.

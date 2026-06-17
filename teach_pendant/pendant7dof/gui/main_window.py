@@ -38,18 +38,20 @@ from .joystick import Joystick
 # Canvas is a fixed 100×100 square (the largest square the pen-down drawable band
 # allows at the current begin pose). Size is no longer user-adjustable — only pen
 # lift and pen-tip offset remain. (See pendant_backend + drawing_batch_planner.)
-# Pen lift: the value sent to the planner is the spinbox value PLUS this
-# baseline, and the spinbox default reads 0 — i.e. "0" on screen = a 50 mm
-# real pen-up lift. Lets the user trim around a safe baseline.
-LIFT_BASELINE_MM = 50.0
-DEFAULT_LIFT_MM = 50.0   # actual lift sent by default (shown as 0)
-DEFAULT_Z_PAPER_OFFSET_MM = 0.0
-# Pen-tip offset: distance from the EE flange to the pen tip (mm). Adjustable so
-# the robot can swap pencil/marker/pen of different lengths. Kept at the current
-# backend value (100) to preserve calibration; the true pen is 157 mm — set that
-# once the begin pose is recentred for the matching paper height (separate step).
-DEFAULT_PEN_OFFSET_MM = 100.0
-MIN_PEN_OFFSET_MM = 20.0
+# Pen lift: the spinbox shows the pen-up TRAVEL CLEARANCE (tip→paper distance,
+# mm). It is sent to the planner negated (planner sign: negative = up), so 25 on
+# screen → lift_mm = -25. The planner floors the clearance at 10 mm so the pen
+# never reaches the table; there is no upper cap.
+DEFAULT_LIFT_DISPLAY_MM = 25.0          # spinbox default (positive clearance)
+MIN_LIFT_DISPLAY_MM = 10.0              # smallest clearance the spinbox allows
+DEFAULT_LIFT_MM = -DEFAULT_LIFT_DISPLAY_MM   # cfg value sent (signed; -25)
+# Pen-tip offset: EE flange → pen tip length (mm). The spinbox shows the REAL pen
+# length; the planner is sent (shown - calibration delta) because the sim
+# under-reaches — a real 157 mm pen lands where a modelled 121 mm one does.
+PEN_OFFSET_CALIB_MM = 36.0
+DEFAULT_PEN_OFFSET_DISPLAY_MM = 157.0   # spinbox default (real pen length)
+DEFAULT_PEN_OFFSET_MM = DEFAULT_PEN_OFFSET_DISPLAY_MM - PEN_OFFSET_CALIB_MM  # 121 sent
+MIN_PEN_OFFSET_MM = 20.0    # planner-side (sent) bounds
 MAX_PEN_OFFSET_MM = 400.0
 
 # Per-tick jog scale at the joystick rate (full stick deflection).
@@ -1876,28 +1878,32 @@ class MainWindow(QMainWindow):
 
         cfg_box = QGroupBox("Drawing settings")
         form = QGridLayout(cfg_box)
-        # Lift spin shows the value RELATIVE to the 50 mm baseline: 0 = 50 mm
-        # real lift. Stored cfg lift_mm is the actual value (display + baseline).
-        # Range is wide-open (the adjustment is uncapped): display down to the
-        # baseline (= 0 mm real lift) and far up; the planner clamps real lift
-        # to >= 0. NOTE: a large lift can pull the canvas corners out of reach
-        # at the pen-up height, so very high values may make travel/lift IK miss.
-        self.lift_spin = self._mm_spin(-LIFT_BASELINE_MM, 950.0,
-                                       self._draw_cfg["lift_mm"] - LIFT_BASELINE_MM)
-        self.lift_spin.setToolTip(f"0 = {LIFT_BASELINE_MM:.0f} mm baseline pen-up "
-                                  f"lift; negative lowers it (min 0 mm real), "
-                                  f"positive raises it. Adjustment is uncapped; "
-                                  f"very high lift can put canvas corners out of "
-                                  f"reach at the pen-up height.")
-        # Pen-tip offset: EE flange → pen tip length (mm). Change when swapping
-        # the pen/marker/pencil for one of a different length.
-        self.pen_off_spin = self._mm_spin(MIN_PEN_OFFSET_MM, MAX_PEN_OFFSET_MM,
-                                          self._draw_cfg["pen_offset_mm"])
-        self.pen_off_spin.setToolTip("Distance from the end-effector flange to "
-                                     "the pen tip (mm). Set this to the length of "
-                                     "the pen/marker/pencil currently mounted. "
-                                     "Changing it shifts the paper plane, so the "
-                                     "begin pose may need re-tuning.")
+        # Lift spin shows the pen-up TRAVEL CLEARANCE (tip→paper, mm). Min 10 mm
+        # so the pen never reaches the table; no upper cap. Sent to the planner
+        # negated (cfg lift_mm = -clearance). NOTE: a large lift can pull the
+        # canvas corners out of reach at the pen-up height, so very high values
+        # may make travel/lift IK miss.
+        self.lift_spin = self._mm_spin(MIN_LIFT_DISPLAY_MM, 1000.0,
+                                       -self._draw_cfg["lift_mm"])
+        self.lift_spin.setToolTip("Pen-up clearance (mm) between the tip and the "
+                                  "paper while the robot travels between strokes. "
+                                  f"Min {MIN_LIFT_DISPLAY_MM:.0f} mm (so the pen "
+                                  "never touches the table); no upper limit, but "
+                                  "very high lift can put canvas corners out of "
+                                  "reach at the pen-up height.")
+        # Pen-tip offset: EE flange → pen tip length (mm). Shows the REAL pen
+        # length; the planner is sent (shown - calibration delta).
+        self.pen_off_spin = self._mm_spin(
+            MIN_PEN_OFFSET_MM + PEN_OFFSET_CALIB_MM,
+            MAX_PEN_OFFSET_MM + PEN_OFFSET_CALIB_MM,
+            self._draw_cfg["pen_offset_mm"] + PEN_OFFSET_CALIB_MM)
+        self.pen_off_spin.setToolTip("Real pen length: distance from the "
+                                     "end-effector flange to the pen tip (mm). "
+                                     "Set this to the actual pen/marker/pencil "
+                                     f"length; the planner subtracts a "
+                                     f"{PEN_OFFSET_CALIB_MM:.0f} mm sim "
+                                     "calibration delta so the tip lands on the "
+                                     "paper.")
         form.addWidget(QLabel("Pen lift (mm)"), 0, 0)
         form.addWidget(self.lift_spin, 0, 1)
         form.addWidget(QLabel("Pen tip offset (mm)"), 1, 0)
@@ -1949,14 +1955,14 @@ class MainWindow(QMainWindow):
 
     def _apply_draw_cfg(self) -> None:
         # Canvas size is fixed; only pen lift and pen-tip offset are adjustable.
-        self._draw_cfg["lift_mm"] = self.lift_spin.value() + LIFT_BASELINE_MM
-        self._draw_cfg["pen_offset_mm"] = self.pen_off_spin.value()
+        self._draw_cfg["lift_mm"] = -self.lift_spin.value()
+        self._draw_cfg["pen_offset_mm"] = self.pen_off_spin.value() - PEN_OFFSET_CALIB_MM
         # New settings shift the drawing frame, so park at Home first.
         self.node.goto_preset("Home")
 
     def _drawing_message(self) -> dict:
-        self._draw_cfg["lift_mm"] = self.lift_spin.value() + LIFT_BASELINE_MM
-        self._draw_cfg["pen_offset_mm"] = self.pen_off_spin.value()
+        self._draw_cfg["lift_mm"] = -self.lift_spin.value()
+        self._draw_cfg["pen_offset_mm"] = self.pen_off_spin.value() - PEN_OFFSET_CALIB_MM
         msg = self.canvas.get_drawing()
         msg["config"] = dict(self._draw_cfg)
         return msg
