@@ -36,6 +36,15 @@ VEL_HEADROOM = 1.5        # the velocity LIMIT must cover the per-cycle position
                           # suffer; straight constant-speed strokes don't). Cap = max(EMA
                           # floor, instantaneous demand * this headroom).
 POS_DEADBAND_RAD = 0.0015  # ~0.09 deg; skip re-commanding changes smaller than this
+HOLD_DEMAND_RADPS = 0.01   # the deadband above is ONLY meant to stop the motor hunting
+                          # around a setpoint while HOLDING STILL. It must NOT quantize an
+                          # active stroke: at a slow draw (draw_speed_mm_s=5) the per-tick
+                          # joint motion (~1.7e-4 rad) is well below POS_DEADBAND_RAD, so a
+                          # blanket deadband skips ~8/9 commands and the joint advances in
+                          # 0.09-deg jumps at ~11 Hz -> visibly STEPPY slow strokes. So the
+                          # deadband is gated: it applies only when the incoming stream is
+                          # essentially static (per-cycle demand < this). While actually
+                          # drawing, every command passes through -> smooth slow motion.
 STALE_DT_S = 0.5          # gap above which dt is treated as a restart (reseed, no vel)
 
 POS_VEL_ACC = 200.0
@@ -189,11 +198,16 @@ class PosMotorSub(Node):
             self._pos_f[can_id] = pos_f
             self._vel_f[can_id] = vel_f
 
-            # (3) Deadband: while essentially holding, don't re-command — stops
-            #     the motor hunting around the setpoint. Small moves accumulate
-            #     against the last *sent* position, so slow motion still advances.
+            # (3) Deadband — GATED to hold-still only. While the stream is
+            #     essentially static (demand < HOLD_DEMAND_RADPS) we suppress
+            #     re-commanding sub-deadband changes so the motor doesn't hunt
+            #     around the setpoint at rest. While actively drawing we pass
+            #     every command through, otherwise the deadband would quantize a
+            #     slow stroke into ~0.09-deg steps at ~11 Hz (steppy motion).
             last_sent = self._last_sent.get(can_id)
-            if last_sent is not None and abs(pos_f - last_sent) < POS_DEADBAND_RAD:
+            holding = demand < HOLD_DEMAND_RADPS
+            if (holding and last_sent is not None
+                    and abs(pos_f - last_sent) < POS_DEADBAND_RAD):
                 continue
             self._last_sent[can_id] = pos_f
 
