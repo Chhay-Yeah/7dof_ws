@@ -103,6 +103,82 @@ def replay_series(source, cfg, force_diff=False, lo=None, hi=None):
     return t_out, vel, names, label
 
 
+# ── per-joint commanded-vs-executed velocity ─────────────────────────────────
+
+def replay_cmd_exec(source, cfg, lo=None, hi=None):
+    """Return (t, cmd_vel[N,7]|None, exec_vel[N,7], names, exec_label) for the
+    per-joint figure. commanded = filtered diff of the COMMANDED joint position
+    ('what it was supposed to move'); executed = the measured motor velocity when
+    available, else the filtered diff of the measured encoder position. cmd_vel
+    is None when no commanded joint stream exists (e.g. a simulation bag)."""
+    names = cfg['fk']['joint_names']
+    fps = cfg['timeline']['resample_fps']
+
+    if data_io.is_csv(source):
+        d = data_io.read_csv(source, names)
+        m = np.all(np.isfinite(d['cmd']), axis=1) & np.all(np.isfinite(d['enc']), axis=1)
+        t = d['t'][m]
+        grid = data_io.make_timeline(t.min(), t.max(), fps)
+        cmd_vel, _ = data_io.velocity_from_position(grid, data_io.resample(t, d['cmd'][m], grid), cfg)
+        if np.isfinite(d['enc_vel'][m]).all():
+            exec_vel = data_io.resample(t, d['enc_vel'][m], grid)
+            exec_label = 'measured encoder velocity'
+        else:
+            exec_vel, _ = data_io.velocity_from_position(grid, data_io.resample(t, d['enc'][m], grid), cfg)
+            exec_label = 'executed: diff of encoder pos'
+        t_out = grid
+    else:
+        data = data_io.read_bag(source)
+        if not data['joint_states']:
+            sys.exit('ERROR: no executed joint stream in bag.')
+        t0 = data_io.time_origin(data, cfg)
+        te, pe = data_io.jointstate_series(data['joint_states'], names)
+        grid = data_io.make_timeline((te - t0).min(), (te - t0).max(), fps)
+        exec_vel, _ = data_io.velocity_from_position(grid, data_io.resample(te - t0, pe, grid), cfg)
+        exec_label = 'executed: diff of encoder pos'
+        cmd_msgs = data.get('joint_states_commanded')   # present on real-HW bags
+        if cmd_msgs:
+            tc, pc = data_io.jointstate_series(cmd_msgs, names)
+            cmd_vel, _ = data_io.velocity_from_position(grid, data_io.resample(tc - t0, pc, grid), cfg)
+        else:
+            cmd_vel = None
+        t_out = grid
+
+    if lo is not None or hi is not None:
+        w = data_io.time_mask(t_out, lo, hi)
+        t_out, exec_vel = t_out[w], exec_vel[w]
+        if cmd_vel is not None:
+            cmd_vel = cmd_vel[w]
+    return t_out, cmd_vel, exec_vel, names, exec_label
+
+
+def draw_per_joint(fig, t, cmd_vel, exec_vel, names, exec_label):
+    """7 small panels, one per joint: commanded (dashed grey) vs executed
+    (coloured). The 8th cell of the 4x2 grid holds a shared legend."""
+    nrows, ncols = 4, 2
+    axes = fig.subplots(nrows, ncols, sharex=True).ravel()
+    for k, name in enumerate(names):
+        ax = axes[k]
+        if cmd_vel is not None:
+            ax.plot(t, cmd_vel[:, k], lw=1.6, ls='--', color='0.45', label='commanded')
+        ax.plot(t, exec_vel[:, k], lw=1.4, color=JOINT_COLORS[k], label='executed')
+        ax.set_title(name, fontsize=10)
+        ax.grid(True, ls=':', alpha=0.5)
+        if k % ncols == 0:
+            ax.set_ylabel('vel (rad/s)', fontsize=8)
+    # x-labels on the bottom-most populated panel of each column
+    for k in (len(names) - 1, len(names) - ncols):
+        if 0 <= k < len(axes):
+            axes[k].set_xlabel('time (s)', fontsize=8)
+    # spare cell → legend
+    for j in range(len(names), len(axes)):
+        axes[j].axis('off')
+    handles, labels = axes[0].get_legend_handles_labels()
+    (axes[len(names)] if len(names) < len(axes) else axes[0]).legend(
+        handles, labels, loc='center', fontsize=12, frameon=True)
+    fig.suptitle(f'Per-joint velocity — commanded vs executed ({exec_label})', fontsize=13)
+
+
 # ── live ROS subscriber (decoupled — subscribe only) ─────────────────────────
 
 class LiveVel:
@@ -250,6 +326,9 @@ def main():
     ap.add_argument('--diff', action='store_true',
                     help='CSV mode: differentiate measured position instead of using '
                          'the measured encoder velocity')
+    ap.add_argument('--per-joint', action='store_true',
+                    help='export a 7-panel figure (one per joint) of commanded vs '
+                         'executed velocity instead of the single overlaid plot')
     ap.add_argument('--start', type=float, default=None,
                     help='trim: window start in t_rel seconds (e.g. just the drawing)')
     ap.add_argument('--end', type=float, default=None, help='trim: window end (t_rel s)')
@@ -263,11 +342,20 @@ def main():
         global JOINT_COLORS
         JOINT_COLORS = matplotlib.colormaps['tab10'].colors
         from matplotlib.figure import Figure
+        outdir = args.outdir or data_io.figures_dir(cfg)
+        if args.per_joint:
+            t, cmd_vel, exec_vel, names, exlab = replay_cmd_exec(
+                args.replay, cfg, lo=args.start, hi=args.end)
+            if cmd_vel is None:
+                print('NOTE: no commanded joint stream (sim bag?) — plotting executed only.')
+            fig = Figure(figsize=(9.0, 10.0))
+            draw_per_joint(fig, t, cmd_vel, exec_vel, names, exlab)
+            export(fig, outdir, cfg['velocity']['export_stem'] + '_per_joint')
+            return
         t, vel, names, label = replay_series(args.replay, cfg, force_diff=args.diff,
                                              lo=args.start, hi=args.end)
         fig = Figure(figsize=(7.5, 4.5)); ax = fig.add_subplot(111)
         draw_traces(ax, t, vel, names, label)
-        outdir = args.outdir or data_io.figures_dir(cfg)
         export(fig, outdir, cfg['velocity']['export_stem'])
         pk = np.max(np.abs(vel), axis=0)
         print('peak |velocity| per joint (rad/s): ' +
