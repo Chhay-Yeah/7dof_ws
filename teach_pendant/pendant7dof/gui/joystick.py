@@ -30,6 +30,12 @@ class Joystick(QWidget):
         self.x_label, self.y_label, self.twist_label = x_label, y_label, twist_label
         self.update()
 
+    def set_axis_lock(self, enabled: bool) -> None:
+        """Constrain the knob to one axis at a time (slider-like). The chosen
+        axis is re-picked on each fresh grab."""
+        self.axis_lock = bool(enabled)
+        self._locked_axis = None
+
     def __init__(self, on_jog=None, rate_hz: float = 15.0) -> None:
         super().__init__()
         self.on_jog = on_jog
@@ -37,6 +43,12 @@ class Joystick(QWidget):
         self.x = 0.0          # -1..1
         self.y = 0.0          # -1..1 (up = +)
         self.twist = 0.0      # -1..1
+        # Axis-lock: when on, the knob commits to a single axis (whichever the
+        # user first pulls toward) and the other axis is held at 0 for the rest
+        # of the drag, so the control behaves like an X-or-Y slider. Used by
+        # Cartesian jog so only one Cartesian axis moves at a time.
+        self.axis_lock = False
+        self._locked_axis = None   # None | 'x' | 'y' (chosen per drag)
         # Short labels for what each direction drives (set by the consumer).
         self.x_label = "X"
         self.y_label = "Y"
@@ -217,6 +229,7 @@ class Joystick(QWidget):
         what = self._hit(e.position())
         if what == "knob":
             self._knob_active = True
+            self._locked_axis = None   # re-pick the axis each fresh grab
             self._update_knob(e.position())
         elif what == "ring":
             self._ring_active = True
@@ -246,6 +259,7 @@ class Joystick(QWidget):
         self._knob_active = False
         self._ring_active = False
         self.x = self.y = self.twist = 0.0
+        self._locked_axis = None
         self._timer.stop()
         # Emit one final centered tick so the consumer learns the jog stopped
         # (the timer is now stopped, so _tick won't fire again). The Cartesian
@@ -259,6 +273,19 @@ class Joystick(QWidget):
         c, r_base, *_ = self._metrics()
         dx = (pos.x() - c.x()) / r_base
         dy = -(pos.y() - c.y()) / r_base
+        if self.axis_lock:
+            # Commit to the dominant axis once the knob is pulled clear of a
+            # small centre deadzone, then hold that axis for the rest of the
+            # drag so only X *or* Y ever moves (slider feel). The other axis is
+            # zeroed, so the knob travels along a straight line.
+            if self._locked_axis is None and math.hypot(dx, dy) > 0.18:
+                self._locked_axis = "x" if abs(dx) >= abs(dy) else "y"
+            if self._locked_axis == "x":
+                dy = 0.0
+            elif self._locked_axis == "y":
+                dx = 0.0
+            else:
+                dx = dy = 0.0   # not committed yet → stay put (no diagonal leak)
         mag = math.hypot(dx, dy)
         if mag > 1.0:
             dx, dy = dx / mag, dy / mag

@@ -1811,6 +1811,9 @@ class MainWindow(QMainWindow):
         self.group_toggle_btn.setVisible(not cartesian)
         self.joint_set_box.setVisible(not cartesian)
         self.cart_set_box.setVisible(cartesian)
+        # Cartesian jog: lock the joystick to one axis at a time (slider feel) so
+        # only X or only Y moves per drag. Joint modes keep the free 2-axis knob.
+        self.joystick.set_axis_lock(cartesian)
         if cartesian:
             self.joystick.set_labels("X", "Y", "Z")
         elif self.jog_group == 2:
