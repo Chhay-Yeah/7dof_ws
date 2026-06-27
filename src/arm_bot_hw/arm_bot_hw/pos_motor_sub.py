@@ -50,6 +50,16 @@ STALE_DT_S = 0.5          # gap above which dt is treated as a restart (reseed, 
 POS_VEL_ACC = 200.0
 POS_VEL_DEC = 200.0
 
+# Topic on which this node republishes the MEASURED motor encoder feedback as a
+# JointState (position + velocity, inversion undone, canonical joint order). On
+# the real arm the encoder is only readable from inside this process (it owns the
+# single USB-CAN adapter), so without this nothing else on ROS can see the
+# executed motion. Publishing it lets a decoupled, observe-only recorder
+# (results_tools/record_draw.py / capture.py — `ros2 bag record`) capture the
+# real executed trajectory from a SEPARATE terminal, exactly like the simulation
+# flow, without touching the adapter. /joint_states stays the COMMANDED stream.
+ENCODER_TOPIC = '/encoder_states'
+
 
 class PosMotorSub(Node):
     def __init__(self):
@@ -144,7 +154,14 @@ class PosMotorSub(Node):
                 f'ACC={POS_VEL_ACC} DEC={POS_VEL_DEC} rad/s^2'
             )
 
-        self.get_logger().info('PosMotorSub initialised – subscribing to /joint_states')
+        # Publisher for the measured encoder feedback (see ENCODER_TOPIC note).
+        self.enc_pub = self.create_publisher(JointState, ENCODER_TOPIC, 10)
+        # Canonical joint order for the encoder message (joint_1..joint_7).
+        self._enc_joints = sorted(self.joint_canid_map)
+
+        self.get_logger().info(
+            f'PosMotorSub initialised – subscribing to /joint_states, '
+            f'publishing measured encoder on {ENCODER_TOPIC}')
 
         self.subscription = self.create_subscription(
             JointState,
@@ -217,6 +234,32 @@ class PosMotorSub(Node):
             self.get_logger().debug(
                 f'{name}  can_id=0x{can_id:02X}  pos={pos_f:.4f} rad  vel={target_vel:.4f} rad/s'
             )
+
+        # Driving the motors above refreshes each motor's encoder state, so read
+        # and republish it now. Stamp it with the incoming /joint_states stamp so
+        # the executed feedback aligns with the command on a shared timeline.
+        self._publish_encoder(msg.header.stamp)
+
+    def _publish_encoder(self, stamp):
+        """Read the MEASURED encoder of every mapped motor and publish it as a
+        JointState on ENCODER_TOPIC (position + velocity, inversion undone,
+        canonical joint order)."""
+        enc = JointState()
+        enc.header.stamp = stamp
+        for j in self._enc_joints:
+            can_id = self.joint_canid_map[j]
+            motor = self.control.getMotor(can_id)
+            if motor is None:
+                continue
+            pos = motor.Get_Position()
+            vel = motor.Get_Velocity()
+            if can_id in self.inverted_motors:    # undo command-side inversion
+                pos = -pos
+                vel = -vel
+            enc.name.append(j)
+            enc.position.append(float(pos))
+            enc.velocity.append(float(vel))
+        self.enc_pub.publish(enc)
 
     def destroy_node(self):
         self.get_logger().info('Shutting down – disabling all motors')

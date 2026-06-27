@@ -130,7 +130,7 @@ def read_bag(uri):
     typemap = {t.name: t.type for t in reader.get_all_topics_and_types()}
 
     out = {'urdf': None, 'joint_states': [], 'joint_commands': [],
-           'cartesian_path': [], 'motor_target': []}
+           'cartesian_path': [], 'motor_target': [], 'encoder_states': []}
 
     while reader.has_next():
         topic, data, t_recv = reader.read_next()
@@ -147,8 +147,21 @@ def read_bag(uri):
             out['joint_states'].append((_stamp(msg, t_recv_s), msg))
         elif topic == '/joint_commands':
             out['joint_commands'].append((_stamp(msg, t_recv_s), msg))
+        elif topic == '/encoder_states':
+            out['encoder_states'].append((_stamp(msg, t_recv_s), msg))
         elif topic == '/motor_target':
             out['motor_target'].append((t_recv_s, list(msg.data)))
+
+    # On the REAL arm the measured/executed motion is published on /encoder_states
+    # by pos_motor_sub, while /joint_states there is the COMMANDED stream the
+    # controller emits. In simulation there is no /encoder_states and /joint_states
+    # IS the executed feedback. The generators all treat data['joint_states'] as
+    # the executed/feedback stream, so when an encoder stream is present, promote
+    # it into that slot (keeping the commanded one under 'joint_states_commanded').
+    # This makes a hardware bag work with the same generators as a sim bag.
+    if out['encoder_states']:
+        out['joint_states_commanded'] = out['joint_states']
+        out['joint_states'] = out['encoder_states']
     return out
 
 

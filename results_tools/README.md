@@ -21,10 +21,39 @@ Plus **`record_draw.py`** (the observer/recorder), **`capture.py`** /
 knob), and the shared library: **`fk_chain.py`** (the *one* FK) and
 **`data_io.py`** (bag + CSV reading, URDF resolution, time-alignment, velocity).
 
-### Real-hardware flow (encoder CSV) — what you actually run
+### Real-hardware flow — pick one
 
-On the real arm, `pos_motor_sub` owns the single USB-CAN adapter, so the encoder
-can only be read from inside that process. Use **`arm_bot_hw record_encoder`**
+On the real arm, `pos_motor_sub` owns the single USB-CAN adapter, so the measured
+encoder can only be read from inside that process. There are two ways to record;
+**flow A is the recommended one — it mirrors the simulation workflow.**
+
+#### Flow A — decoupled bag (same as simulation, recommended)
+
+`pos_motor_sub` republishes the measured encoder it reads on **`/encoder_states`**
+(JointState, position + velocity). That puts the executed motion on a ROS topic,
+so you record it from a **separate, observe-only terminal** with `ros2 bag record`
+— exactly like sim, no pose cue, never touches the adapter. Run your normal stack
+(`pos_motor_sub` as the motor driver), then in another terminal:
+
+```bash
+source ~/7dof_ws/install/setup.bash
+python3 results_tools/capture.py --name square   # start FIRST (before the draw)
+#   ... hit Send so the robot draws ...
+#   ... Ctrl-C when it finishes ...
+#   -> records a bag AND renders all three artifacts into figures/square/
+```
+
+`capture.py` records `/joint_states` (commanded) + `/encoder_states` (executed) +
+`/cartesian_path` + URDF, then on Ctrl-C renders the three figures. To only record
+(generate later), use `record_draw.py` instead and run the generators against the
+bag dir. `read_bag` auto-promotes `/encoder_states` to the executed stream, so the
+path overlay/velocity/animation come out identical to a sim bag. The bag-mode
+velocity figure differentiates the encoder position (same as sim); use Flow B if
+you want the motor's directly-reported velocity in the CSV.
+
+#### Flow B — encoder CSV (one process, auto/manual window)
+
+Use **`arm_bot_hw record_encoder`**
 (it subclasses `pos_motor_sub`, drives the draw identically, and logs the
 measured encoder of all 7 joints to a CSV):
 

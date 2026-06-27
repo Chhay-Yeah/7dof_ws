@@ -38,7 +38,10 @@ record:
   # artifacts. The recorder also captures the rest if they are being published.
   feedback_topic: /joint_states
   topics:
-    - /joint_states               # encoder feedback  (primary)
+    - /joint_states               # sim: encoder feedback. real arm: COMMANDED stream
+    - /encoder_states             # real arm: MEASURED motor encoder (pos+vel) from
+                                  #   pos_motor_sub. Absent in sim. When present,
+                                  #   read_bag promotes it to the executed stream.
     - /cartesian_path             # commanded pen path (one-shot, paper frame)
     - /robot_description          # latched URDF for FK
     - /motor_target               # MATLAB commanded setpoints (Float64MultiArray)
