@@ -103,16 +103,45 @@ def generate_launch_description():
         package="arm_bot", executable="drawing_batch_planner.py", name="drawing_batch_planner",
         output="screen",
         parameters=[{
+            # NOTE: kept in sync with pendant_backend.launch.py's drawing block
+            # (the Gazebo-verified config). This launch was previously stale —
+            # it lacked draw_tilt (→ perpendicular mode), max_workspace_mm (→ the
+            # 100 mm canvas was clamped to the 50 mm declare default), the canvas
+            # anchor, pen_offset_ref_mm and the table-tilt knobs.
             "use_sim_time": sim_time,
             "begin_draw_joints": [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0],
-            "pen_offset_mm": 121.0, "pen_axis_local": [1.0, 0.0, 0.0],
-            "move_to_begin_seconds": 4.0, "dwell_seconds": 3.0,
+            # Value the planner USES (tip lands on the paper in sim). The GUI
+            # shows the real pen length and subtracts a 36 mm sim-vs-real delta
+            # before sending → 121. On hardware see pen_offset_ref_mm below.
+            "pen_offset_mm": 121.0,
+            # Reference length the begin pose was calibrated at. When the live
+            # pen_offset_mm differs, the begin pose is re-solved so the pen tip
+            # lands on the same table point. Match this to the length begin_draw
+            # was tuned with so changing pens only shifts EE height, not contact.
+            "pen_offset_ref_mm": 100.0,
+            "pen_axis_local": [1.0, 0.0, 0.0],
+            "move_to_begin_seconds": 6.0,
+            "approach_seconds": 3.0,
+            "dwell_seconds": 3.0,
             "stroke_dwell_seconds": 2.0,
             "corner_angle_deg": 40.0, "corner_dwell_seconds": 1.0,
-            "workspace_x_mm": 40.0, "workspace_y_mm": 40.0, "lift_mm": -25.0,
+            "draw_tilt": True,
+            "workspace_x_mm": 100.0, "workspace_y_mm": 100.0,
+            "max_workspace_mm": 300.0,
+            "canvas_anchor_x_mm": 10.0, "canvas_anchor_y_mm": 18.0,
+            "tilt_max_deg": 30.0,
+            "lift_mm": -25.0,
             "log_joint_deltas": True, "locked_joints": [-1], "null_k": 2.0,
             "joint_weights": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0],
-            "paper_rotation_deg": 270, "paper_mirror_x": False, "travel_speed_mm_s": 15.0,
+            "paper_rotation_deg": 270, "paper_mirror_x": False,
+            # Table-tilt compensation (deg) for a table not parallel to the robot
+            # base. tilt_x = rot about base +X (base-Y slope), tilt_y = rot about
+            # base +Y (base-X slope). Your VERTICAL canvas lines run along base +X
+            # (the reach axis, paper_rotation 270 → canvas Y → base +X), so a
+            # reach-axis table slope shows up there → calibrate table_tilt_y_deg.
+            "table_tilt_x_deg": 0.0,
+            "table_tilt_y_deg": 0.0,
+            "travel_speed_mm_s": 15.0,
         }],
     )
     rviz = IncludeLaunchDescription(

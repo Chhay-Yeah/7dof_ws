@@ -273,6 +273,12 @@ def generate_launch_description():
             "table_tilt_x_deg": 0.0,
             "table_tilt_y_deg": 0.0,
             "travel_speed_mm_s": 15.0,
+            # Pen-down draw speed (mm/s). Dropped 15→5 because the real
+            # gravity-loaded reach joints (joint_2/4) track a continuously-curving
+            # stroke poorly at speed — the residual lift/dip on a circle scales
+            # with stroke speed. Slower = far less dynamic following error. Raise
+            # back toward 15 once the circle is clean if you want it faster.
+            "draw_speed_mm_s": 5.0,
         }],
     )
 

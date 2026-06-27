@@ -19,18 +19,8 @@ def generate_launch_description():
              name='drawing_batch_planner', output='screen',
              parameters=[{
                  'use_sim_time': True,
-                 
-                 # Tuned via workspace_prober.py: this pose puts the EE at
-                 # (+0.36, -0.01, +0.14) m with pen direction (-0.76, -0.36,
-                 # -0.54) and yields 243/289 reachable cells in a ±80 mm
-                 # paper-frame grid → 100 × 100 mm safe centred square.
-                 # joint_5 (index 4) = 0.01 instead of dead-zero / 0.4: even a
-                 # tiny PID settling error on real hardware would lift the
-                 # pen tip off the paper, so we offset slightly off zero.
-                 # joint_7 (index 6) = 1.0 — rolls the wrist so the pen sits
-                 # roughly perpendicular to the paper for full contact.
-                 # The 10× weight on joint_7 below holds it here throughout
-                 # the drawing, so no mid-trajectory wrist rolling is needed.
+
+
                  'begin_draw_joints': [0.0, -0.4, 0.0, 1.2, 0.0, 0.0, 0.0],
                  # Virtual pen length beyond the EE link (no real gripper).
                  'pen_offset_mm':         121.0,
@@ -46,18 +36,12 @@ def generate_launch_description():
                  'move_to_begin_seconds': 4.0,
                  'dwell_seconds':         3.0,
                  # Pen-down hold at each stroke's start and end (zero-motion).
-                 'stroke_dwell_seconds':  2.0,
+                 'stroke_dwell_seconds':  3.0,
                  # Sharp corners: split the spline at vertices turning more than
                  # this (deg); corner_dwell holds there for a hard stop (0=off).
                  'corner_angle_deg':      40.0,
                  'corner_dwell_seconds':  1.0,
-                 # Paper extents matching the prober's safe centred square
-                 # under the horizontal-paper convention. Shrunk from 60 to
-                 # 40 mm to keep targets well inside the reachable shell —
-                 # the 60 mm edge pushed joint_6 to its +0.262 rad limit and
-                 # made the IK branch-jump mid-stroke.
-                 'workspace_x_mm':        40.0,
-                 'workspace_y_mm':        40.0,
+
                  # lift_mm = lift distance "away from paper". The planner
                  # negates it internally because paper +Z points INTO the
                  # paper (along pen direction). Always pass a positive value.
@@ -67,35 +51,14 @@ def generate_launch_description():
                  # trajectory point (~20–100 per drawing). Set False to
                  # silence.
                  'log_joint_deltas':      True,
-                 # Indices of joints to FREEZE at begin_draw. [-1] is the
-                 # sentinel for "no joints locked" — all 7 joints free.
-                 # Other examples:
-                 #   [2, 4]          → lock redundant continuous joints 3,5
-                 #   [1, 2, 4, 5]    → lock joints 2/3/5/6 (only 1/4/7 free)
-                 # Anything that leaves fewer than 6 active joints makes
-                 # the IK under-determined and will produce "IK failed"
-                 # for off-centre targets.
-                 # No joints locked. Hard-locking joint_7 dropped effective
-                 # DOF to 6 and made joint_6 saturate at its tight upper
-                 # limit (+0.262) on every off-centre waypoint → IK failed.
-                 # Instead we just heavily penalise joint_7 motion below
-                 # via joint_weights so it stays near 0.5 without losing
-                 # the IK's 7-DOF slack.
+
                  'locked_joints':         [-1],
                  # Null-space pull toward begin_draw. Each waypoint is re-
                  # seeded from q_begin (see drawing_batch_planner.py IK
                  # loop) — null_k just sets the centring strength once
                  # solve_ik starts iterating. 2.0 matches workspace_prober.
                  'null_k':                2.0,
-                 # Per-joint penalty for weighted DLS. Uniform = let the
-                 # solver pick the lowest-norm joint motion. Crank a joint
-                 # higher (e.g. j_6 to 3.0) only if it consistently lands
-                 # at a limit in the trajectory dump.
-                 # joint_7 weighted 10× to keep the pen tilt close to 0.5
-                 # without hard-locking (which broke IK). The IK still
-                 # uses joint_7 if it has no other option, but otherwise
-                 # leaves it alone. Bump higher (e.g. 50) to glue it even
-                 # tighter, lower if you see "IK failed" on edge targets.
+
                  #                          j_1  j_2  j_3  j_4  j_5  j_6  j_7
                  'joint_weights':         [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0],
                  # Canvas axis convention chosen by the user:

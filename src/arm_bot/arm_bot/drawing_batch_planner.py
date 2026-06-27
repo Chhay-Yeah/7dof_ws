@@ -134,6 +134,11 @@ class DrawingBatchPlanner(Node):
         # Pre-drawing motion: joint-space move to begin_draw, then dwell.
         self.declare_parameter('move_to_begin_seconds',  4.0)
         self.declare_parameter('dwell_seconds',          3.0)
+        # After the last stroke, return to the begin_draw HOVER pose so the run
+        # ends exactly where the drawing began. Gives the encoder recorder a
+        # clean begin_draw → draw → begin_draw bracket to auto start/stop on.
+        # 0 disables (arm stays lifted at the last stroke, as before).
+        self.declare_parameter('return_to_begin_seconds', 4.0)
 
         # ── Workspace mapping (paper-relative) ─────────────────────────────
         # Canvas centred on the pen tip at begin_draw. These are the paper
@@ -299,6 +304,7 @@ class DrawingBatchPlanner(Node):
         self.pen_axis_local   /= np.linalg.norm(self.pen_axis_local)
         self.t_move_to_begin   = float(gp('move_to_begin_seconds'))
         self.t_dwell           = float(gp('dwell_seconds'))
+        self.t_return_to_begin = float(gp('return_to_begin_seconds'))
         self.wx, self.wy       = gp('workspace_x_mm'), gp('workspace_y_mm')
         self.lift_mm           = float(gp('lift_mm'))
         self.max_workspace_mm  = float(gp('max_workspace_mm'))
@@ -833,6 +839,18 @@ class DrawingBatchPlanner(Node):
             traj.points.append(pt)
 
             q_seed = q_sol
+
+        # Phase 4: return to the begin_draw HOVER pose so the run ends exactly
+        # where the drawing began (same q_hover held at the start). This closes
+        # the begin_draw → draw → begin_draw bracket the encoder recorder uses
+        # to auto start/stop. Skipped when return_to_begin_seconds == 0.
+        if self.t_return_to_begin > 0.0:
+            cum_t += self.t_return_to_begin
+            pt_ret = JointTrajectoryPoint()
+            pt_ret.positions = q_hover.tolist()
+            pt_ret.time_from_start = self._seconds_to_duration(cum_t)
+            traj.points.append(pt_ret)
+            point_kinds.append('return_begin')
 
         # Refuse to publish a useless trajectory — if IK can't reach the first
         # waypoint, the controller would just sit at q_start and the user
