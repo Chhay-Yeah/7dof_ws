@@ -69,6 +69,9 @@ def main():
     ap.add_argument('--frame', default=po.get('frame', 'paper'), choices=['paper', 'base'])
     ap.add_argument('--no-time-window', action='store_true',
                     help='plot the whole executed bag, not just the draw window')
+    ap.add_argument('--start', type=float, default=None,
+                    help='CSV mode: trim window start in t_rel seconds (just the drawing)')
+    ap.add_argument('--end', type=float, default=None, help='CSV mode: trim window end (t_rel s)')
     ap.add_argument('--show', action='store_true')
     args = ap.parse_args()
 
@@ -85,6 +88,7 @@ def main():
         pf = _paper_frame(P, po, chain)
         d = data_io.read_csv(args.bag, fkc['joint_names'])
         m = np.all(np.isfinite(d['enc']), axis=1) & np.all(np.isfinite(d['cmd']), axis=1)
+        m &= data_io.time_mask(d['t'], args.start, args.end)
         # commanded = FK of commanded joints; executed = FK of measured encoder
         cmd_x, cmd_y, cmd_z = _fk_to_plane(pf, chain, d['cmd'][m], args.frame)
         ex, ey, ez = _fk_to_plane(pf, chain, d['enc'][m], args.frame)

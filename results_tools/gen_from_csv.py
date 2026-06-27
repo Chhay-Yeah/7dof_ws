@@ -39,8 +39,17 @@ def main():
     ap.add_argument('--anim-max-frames', type=int, default=0)
     ap.add_argument('--diff', action='store_true',
                     help='velocity from differentiated position instead of measured encoder velocity')
+    ap.add_argument('--start', type=float, default=None,
+                    help='trim ALL artifacts to this t_rel start (s) — e.g. just the drawing')
+    ap.add_argument('--end', type=float, default=None, help='trim end (t_rel s)')
     ap.add_argument('--no-anim', action='store_true')
     args = ap.parse_args()
+
+    window = []
+    if args.start is not None:
+        window += ['--start', str(args.start)]
+    if args.end is not None:
+        window += ['--end', str(args.end)]
 
     if not os.path.exists(args.csv):
         sys.exit(f'ERROR: no such CSV: {args.csv}')
@@ -53,9 +62,10 @@ def main():
     ok = []
     ok.append(('path overlay (fig 4.1)', run_step(
         'path overlay',
-        [_PY, os.path.join(_HERE, 'gen_path_overlay.py'), csv, '--outdir', run_dir])))
+        [_PY, os.path.join(_HERE, 'gen_path_overlay.py'), csv, '--outdir', run_dir] + window)))
 
-    vel = [_PY, os.path.join(_HERE, 'gen_velocity.py'), '--replay', csv, '--export', '--outdir', run_dir]
+    vel = [_PY, os.path.join(_HERE, 'gen_velocity.py'), '--replay', csv, '--export',
+           '--outdir', run_dir] + window
     if args.diff:
         vel.append('--diff')
     ok.append(('joint velocities (fig 4.6)', run_step('joint velocities', vel)))
@@ -63,7 +73,7 @@ def main():
     if not args.no_anim:
         anim = [_PY, os.path.join(_HERE, 'gen_frontview_anim.py'), csv,
                 '--outdir', os.path.join(run_dir, 'frontview'),
-                '--drive', args.drive, '--video', args.video, '--fps', str(args.fps)]
+                '--drive', args.drive, '--video', args.video, '--fps', str(args.fps)] + window
         if args.anim_max_frames:
             anim += ['--max-frames', str(args.anim_max_frames)]
         ok.append(('front-view animation', run_step('front-view animation', anim)))

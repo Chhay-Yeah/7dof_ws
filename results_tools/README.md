@@ -31,10 +31,20 @@ measured encoder of all 7 joints to a CSV):
 ```bash
 source ~/7dof_ws/install/setup.bash
 ros2 run arm_bot_hw record_encoder            # run INSTEAD of pos_motor_sub, then draw
-#   ... Ctrl-C when the robot finishes  ->  recordings/draw_capture.csv  ( (2), (3) … )
+#   ... logging auto-starts/stops at begin_draw; Ctrl-C to exit ...
+#   ->  recordings/draw_capture.csv  ( (2), (3) … )
 
 python3 results_tools/gen_from_csv.py recordings/draw_capture.csv   # -> figures/draw_capture/
 ```
+
+**Auto recording window.** By default the CSV is bracketed by the begin_draw
+pose: logging starts when `/joint_states` settles at begin_draw and stops when it
+settles back there after the draw — so go-to-start / home travel is excluded
+automatically. This relies on the drawing planner returning to begin_draw at the
+end (`drawing_batch_planner` param `return_to_begin_seconds`, default 4.0 s). The
+motors are driven the whole time; only the logging window is gated, and Ctrl-C
+always saves. Disable with `--ros-args -p auto_window:=false` to log everything;
+tune with `begin_tol_rad` / `stop_confirm_s` / `begin_draw_joints` if needed.
 
 `gen_from_csv.py` renders all three artifacts into one run folder. Because the
 CSV carries the **measured encoder velocity**, the velocity figure uses the real
@@ -43,6 +53,17 @@ motor velocity (no differentiation needed); the path overlay compares FK of the
 by the measured encoder (`--drive commanded` to use the command instead). CSV
 mode has no URDF, so FK uses the cached `results_tools/arm_bot.urdf` (regenerate
 with `xacro src/arm_bot/urdf/arm_bot.urdf.xacro > results_tools/arm_bot.urdf`).
+
+**Trimming to just the drawing.** The recording is the whole session (go-to-start
+→ home → begin_draw → draw → home). The path overlay already drops pen-up travel,
+but the velocity figure and animation span everything. Generate once, read the
+drawing window (seconds) off the velocity figure, then re-run with a window —
+`--start`/`--end` (in `t_rel` seconds) trim **all three** at once:
+
+```bash
+python3 results_tools/gen_from_csv.py recordings/draw_capture.csv --start 30 --end 75
+```
+The same flags work on each generator individually.
 
 Everything uses **one FK** (`fk_chain.Chain`, the backend's URDF-driven chain),
 **one joint order** (`joint_1..joint_7`, indexed by name), and **SI units**

@@ -65,10 +65,11 @@ def export(fig, outdir, stem):
 
 # ── headless replay export ───────────────────────────────────────────────────
 
-def replay_series(source, cfg, force_diff=False):
+def replay_series(source, cfg, force_diff=False, lo=None, hi=None):
     """Return (t_rel, vel[N,7], names, label) from a recorded bag OR an encoder
     CSV (auto-detected). For a CSV the default is the MEASURED encoder velocity
-    (real motor velocity); --diff differentiates the measured position instead."""
+    (real motor velocity); --diff differentiates the measured position instead.
+    lo/hi (t_rel seconds) trim to a window — e.g. just the drawing portion."""
     names = cfg['fk']['joint_names']
 
     if data_io.is_csv(source):
@@ -76,25 +77,30 @@ def replay_series(source, cfg, force_diff=False):
         t = d['t']
         if not force_diff and np.isfinite(d['enc_vel']).any():
             m = np.all(np.isfinite(d['enc_vel']), axis=1)
-            return t[m], d['enc_vel'][m], names, 'measured encoder velocity'
-        m = np.all(np.isfinite(d['enc']), axis=1)
-        t, pos = t[m], d['enc'][m]
-        grid = data_io.make_timeline(t.min(), t.max(), cfg['timeline']['resample_fps'])
-        pos_g = data_io.resample(t, pos, grid)
+            t_out, vel, label = t[m], d['enc_vel'][m], 'measured encoder velocity'
+        else:
+            m = np.all(np.isfinite(d['enc']), axis=1)
+            tm, pos = t[m], d['enc'][m]
+            grid = data_io.make_timeline(tm.min(), tm.max(), cfg['timeline']['resample_fps'])
+            pos_g = data_io.resample(tm, pos, grid)
+            vel, lab = data_io.velocity_from_position(grid, pos_g, cfg)
+            t_out, label = grid, 'measured encoder pos, ' + lab
+    else:
+        data = data_io.read_bag(source)
+        if not data['joint_states']:
+            sys.exit('ERROR: no /joint_states in bag.')
+        t, pos = data_io.jointstate_series(data['joint_states'], names)
+        trel = t - data_io.time_origin(data, cfg)
+        grid = data_io.make_timeline(trel.min(), trel.max(), cfg['timeline']['resample_fps'])
+        pos_g = data_io.resample(trel, pos, grid)
         vel, label = data_io.velocity_from_position(grid, pos_g, cfg)
-        return grid, vel, names, 'measured encoder pos, ' + label
+        t_out = grid
 
-    data = data_io.read_bag(source)
-    if not data['joint_states']:
-        sys.exit('ERROR: no /joint_states in bag.')
-    t, pos = data_io.jointstate_series(data['joint_states'], names)
-    t0 = data_io.time_origin(data, cfg)
-    trel = t - t0
-    # resample onto the shared uniform grid before differentiating
-    grid = data_io.make_timeline(trel.min(), trel.max(), cfg['timeline']['resample_fps'])
-    pos_g = data_io.resample(trel, pos, grid)
-    vel, label = data_io.velocity_from_position(grid, pos_g, cfg)
-    return grid, vel, names, label
+    if lo is not None or hi is not None:
+        w = data_io.time_mask(t_out, lo, hi)
+        t_out, vel = t_out[w], vel[w]
+        label += f' [{lo if lo is not None else t_out.min():.1f}–{hi if hi is not None else t_out.max():.1f}s]'
+    return t_out, vel, names, label
 
 
 # ── live ROS subscriber (decoupled — subscribe only) ─────────────────────────
@@ -160,7 +166,7 @@ class LiveVel:
 
 # ── PyQt6 window ─────────────────────────────────────────────────────────────
 
-def run_gui(cfg, live=False, bag=None, force_diff=False):
+def run_gui(cfg, live=False, bag=None, force_diff=False, lo=None, hi=None):
     os.environ.setdefault('QT_API', 'pyqt6')
     import matplotlib
     matplotlib.use('qtagg')
@@ -216,7 +222,7 @@ def run_gui(cfg, live=False, bag=None, force_diff=False):
         timer = QTimer(); timer.timeout.connect(tick); timer.start(50)
         win._timer = timer; win._src = src
     else:
-        t, vel, names_, label = replay_series(bag, cfg, force_diff=force_diff)
+        t, vel, names_, label = replay_series(bag, cfg, force_diff=force_diff, lo=lo, hi=hi)
         state.update(t=t, vel=vel, label=label)
         draw_traces(ax, t, vel, names, label)
         canvas.draw_idle()
@@ -244,6 +250,9 @@ def main():
     ap.add_argument('--diff', action='store_true',
                     help='CSV mode: differentiate measured position instead of using '
                          'the measured encoder velocity')
+    ap.add_argument('--start', type=float, default=None,
+                    help='trim: window start in t_rel seconds (e.g. just the drawing)')
+    ap.add_argument('--end', type=float, default=None, help='trim: window end (t_rel s)')
     args = ap.parse_args()
 
     if args.export:
@@ -254,7 +263,8 @@ def main():
         global JOINT_COLORS
         JOINT_COLORS = matplotlib.colormaps['tab10'].colors
         from matplotlib.figure import Figure
-        t, vel, names, label = replay_series(args.replay, cfg, force_diff=args.diff)
+        t, vel, names, label = replay_series(args.replay, cfg, force_diff=args.diff,
+                                             lo=args.start, hi=args.end)
         fig = Figure(figsize=(7.5, 4.5)); ax = fig.add_subplot(111)
         draw_traces(ax, t, vel, names, label)
         outdir = args.outdir or data_io.figures_dir(cfg)
@@ -264,7 +274,8 @@ def main():
               ', '.join(f'{n}={v:.3f}' for n, v in zip(names, pk)))
         return
 
-    run_gui(cfg, live=args.live, bag=args.replay, force_diff=args.diff)
+    run_gui(cfg, live=args.live, bag=args.replay, force_diff=args.diff,
+            lo=args.start, hi=args.end)
 
 
 if __name__ == '__main__':

@@ -88,6 +88,17 @@ def is_csv(path):
     return isinstance(path, str) and path.lower().endswith('.csv')
 
 
+def time_mask(t, lo=None, hi=None):
+    """Boolean mask selecting t within [lo, hi] (either bound may be None)."""
+    t = np.asarray(t, float)
+    m = np.ones(t.shape, bool)
+    if lo is not None:
+        m &= t >= lo
+    if hi is not None:
+        m &= t <= hi
+    return m
+
+
 # ── bag reading (generalized — all streams) ──────────────────────────────────
 
 def _detect_storage_id(uri):
