@@ -30,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'pos_motor_sub = arm_bot_hw.pos_motor_sub:main',
+            'record_encoder = arm_bot_hw.record_encoder:main',
             'hw_bridge     = arm_bot_hw.hw_bridge:main',
             'damiao        = arm_bot_hw.damiao:main',
             'dev_sn        = arm_bot_hw.dev_sn:main',

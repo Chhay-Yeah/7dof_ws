@@ -1,0 +1,121 @@
+# =============================================================================
+# results_tools — shared configuration for the recorder + three generators.
+#
+# One joint order, one FK chain, consistent units (SI: rad, metres, seconds)
+# everywhere except the paper-plane overlay, which is reported in mm to match
+# the thesis. Every generator reads THIS file so the three artifacts and the
+# video all agree.
+# =============================================================================
+
+# ── kinematics (the backend's URDF-driven chain) ────────────────────────────
+fk:
+  # Canonical joint order. The recorder/loaders index /joint_states BY NAME
+  # (the bag's name order is not sorted), and treat bare /motor_target arrays
+  # as exactly this order.
+  joint_names: [joint_1, joint_2, joint_3, joint_4, joint_5, joint_6, joint_7]
+  base_link: base_link
+  tip_link: ee
+  # URDF source: 'bag' reads /robot_description out of the recording (default).
+  # Set a path to override when a bag lacks it.
+  urdf_path: null
+
+# ── time alignment (cross-cutting) ──────────────────────────────────────────
+timeline:
+  # Everything is resampled onto a shared uniform grid built from the bag's
+  # own message timestamps. fps here is the resample rate for the figures;
+  # the animation has its own fps below.
+  resample_fps: 100.0
+  # Zero the time axis at the trajectory dispatch (/cartesian_path stamp) so
+  # t=0 == motion start, matching make_thesis_figures.py. If no cartesian_path
+  # is present, t=0 is the first joint sample.
+  zero_at_cartesian_path: true
+
+# ── live / recording topics ─────────────────────────────────────────────────
+record:
+  output_dir: draw_runs            # where new recordings land (rosbag2 dirs)
+  storage: sqlite3                 # sqlite3 | mcap
+  # Feedback (encoder) source — chosen in Phase 0. Primary stream for all three
+  # artifacts. The recorder also captures the rest if they are being published.
+  feedback_topic: /joint_states
+  topics:
+    - /joint_states               # encoder feedback  (primary)
+    - /cartesian_path             # commanded pen path (one-shot, paper frame)
+    - /robot_description          # latched URDF for FK
+    - /motor_target               # MATLAB commanded setpoints (Float64MultiArray)
+    - /joint_commands             # IK commanded joints, if the backend graph runs
+
+# ── Deliverable 2: joint velocity figure (also thesis Fig 4.5) ──────────────
+velocity:
+  # No real motor-reported velocity exists on ROS (see README Phase 0), so we
+  # DIFFERENTIATE the encoder position and lightly filter. Stated on the plot.
+  source: diff                     # 'diff' (only supported path today) | 'published'
+  filter: savgol                   # savgol | ema | none
+  savgol_window: 21                # samples (odd); ~0.2 s at 100 Hz
+  savgol_polyorder: 3
+  ema_alpha: 0.25                  # used when filter: ema
+  export_stem: figure_4_6          # -> figures/figure_4_6.{png,pdf}
+                                   # (4.4 = static velocity, 4.5 = joint_6 limits; this
+                                   #  live/replay velocity plot is the new 4.6)
+  live_window_s: 12.0              # rolling window shown in the live PyQt6 view
+
+# ── Deliverable 1: commanded vs executed path overlay (thesis Fig 4.1) ──────
+# executed = FK of the recorded ENCODER /joint_states; commanded = /cartesian_path.
+path_overlay:
+  export_stem: figure_4_1          # -> figures/figure_4_1.{png,pdf}
+  frame: paper                     # paper | base
+  # paper-plane / pen params — defaults match pendant_backend.launch.py
+  begin_draw_joints: [0.0, -0.7, 0.0, 1.4, 0.01, 0.0, 1.0]
+  pen_offset_mm: 100.0
+  pen_axis_local: [1, 0, 0]
+  paper_rotation_deg: 270.0
+  paper_mirror_x: false
+  # executed-window timing (trims the move-to-begin swing + dwell + approach)
+  move_to_begin: 4.0
+  dwell: 3.0
+  settle: 0.5
+  approach: 1.0
+  pen_up_mm: null                  # null = auto from commanded z range
+
+# ── Deliverable 3: front-view animation for video overlay ───────────────────
+frontview:
+  # Which joint stream drives the arm:
+  #   feedback  = recorded /joint_states  (proves the twin matches the encoders)
+  #   commanded = /motor_target or /joint_commands (proves the real arm tracks)
+  drive: feedback                  # feedback | commanded
+  commanded_topic: /motor_target   # used when drive: commanded
+
+  fps: 30.0                        # match your video frame rate
+  trace_pen_tip: true              # accumulate the pen-tip path as it draws
+
+  # ---- projection: line the overlay up with your camera ----
+  # The 3D base-frame point is projected onto a 2D plane. `depth_axis` is the
+  # world axis that points INTO the screen (it is dropped). The remaining two
+  # axes map to screen-right (screen_x) and screen-up (screen_y).
+  projection:
+    depth_axis: y                  # x | y | z  -> axis pointing into the screen
+    screen_x: x                    # world axis drawn to the right
+    screen_y: z                    # world axis drawn up
+    flip_x: false
+    flip_y: false
+    rotation_deg: 0.0              # in-plane rotation to match camera roll
+  # ---- placement in the output frame (pixels) ----
+  render:
+    width: 1920
+    height: 1080
+    origin_px: [960, 900]          # where base_link sits in the frame (x,y)
+    scale_px_per_m: 900.0          # world metres -> pixels
+    line_thickness: 6.0            # arm segment width (pt)
+    joint_marker_size: 9.0         # joint dot size (pt)
+    pen_trace_thickness: 3.0
+    arm_color: "#00e5ff"           # bright = reads over live video
+    joint_color: "#ffffff"
+    pen_trace_color: "#ff3b30"
+  export:
+    # Transparent outputs land in figures/frontview/.
+    png_sequence: true             # frame_%05d.png with alpha
+    video: prores                  # prores (.mov 4444) | webm (vp9 alpha) | none
+    out_subdir: frontview
+
+# ── output locations ────────────────────────────────────────────────────────
+io:
+  figures_dir: figures             # rendered artifacts (PNG/PDF/frames/video)
