@@ -138,6 +138,9 @@ def main():
     print(f'\nGenerating artifacts (front-view drive = {drive})…')
 
     ok = []
+    ok.append(('accuracy CSV (cmd vs measured)', run_step(
+        'accuracy CSV',
+        [_PY, os.path.join(_HERE, 'gen_accuracy_csv.py'), bag, '--outdir', run_dir])))
     ok.append(('path overlay (fig 4.1)', run_step(
         'path overlay',
         [_PY, os.path.join(_HERE, 'gen_path_overlay.py'), bag, '--outdir', run_dir])))
@@ -145,6 +148,10 @@ def main():
         'joint velocities',
         [_PY, os.path.join(_HERE, 'gen_velocity.py'),
          '--replay', bag, '--export', '--outdir', run_dir])))
+    ok.append(('joint velocities per-joint cmd vs meas', run_step(
+        'joint velocities per-joint',
+        [_PY, os.path.join(_HERE, 'gen_velocity.py'),
+         '--replay', bag, '--export', '--per-joint', '--outdir', run_dir])))
     if not args.no_anim:
         anim = [_PY, os.path.join(_HERE, 'gen_frontview_anim.py'), bag,
                 '--outdir', os.path.join(run_dir, 'frontview'),

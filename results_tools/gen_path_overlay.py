@@ -37,13 +37,6 @@ def _load_helpers():
     return P
 
 
-def _paper_frame(P, po, chain):
-    begin = np.array(po['begin_draw_joints'], float)
-    pen_axis = np.array(po['pen_axis_local'], float)
-    return P.PaperFrame(chain, begin, po['pen_offset_mm'] / 1000.0, pen_axis,
-                        po['paper_rotation_deg'], po['paper_mirror_x'])
-
-
 def _fk_to_plane(pf, chain, Q, frame):
     """FK each joint vector in Q to pen-tip (x,y,z) in mm — paper or base frame."""
     xs, ys, zs = [], [], []
@@ -85,7 +78,10 @@ def main():
     if csv_mode:
         urdf = data_io.get_urdf(cfg)
         chain = fk_chain.build_chain(urdf, fkc['base_link'], fkc['tip_link'])
-        pf = _paper_frame(P, po, chain)
+        begin = np.array(po['begin_draw_joints'], float)
+        pen_axis = np.array(po['pen_axis_local'], float)
+        pf = P.PaperFrame(chain, begin, po['pen_offset_mm'] / 1000.0,
+                          pen_axis, po['paper_rotation_deg'], po['paper_mirror_x'])
         d = data_io.read_csv(args.bag, fkc['joint_names'])
         m = np.all(np.isfinite(d['enc']), axis=1) & np.all(np.isfinite(d['cmd']), axis=1)
         m &= data_io.time_mask(d['t'], args.start, args.end)
@@ -101,14 +97,21 @@ def main():
             sys.exit('ERROR: no /joint_states in bag.')
         if not data['cartesian_path']:
             sys.exit('ERROR: no /cartesian_path in bag — nothing to compare against.')
-        chain = fk_chain.build_chain(urdf, fkc['base_link'], fkc['tip_link'])
-        pf = _paper_frame(P, po, chain)
-
         pa = data['cartesian_path'][-1]
+        if not pa.poses:
+            sys.exit('ERROR: /cartesian_path has 0 poses — this bag has no drawing waypoints '
+                     '(motion-only task). Path overlay is not applicable.')
+        chain = fk_chain.build_chain(urdf, fkc['base_link'], fkc['tip_link'])
+
         cmd = np.array([[ps.position.x, ps.position.y, ps.position.z] for ps in pa.poses])
         t0 = data_io.time_origin(data, cfg)
         draw_start = (t0 + po['move_to_begin'] + po['dwell'] + po['settle'] + po['approach']
                       if not args.no_time_window else -np.inf)
+
+        pen_axis = np.array(po['pen_axis_local'], float)
+        begin = np.array(po['begin_draw_joints'], float)
+        pf = P.PaperFrame(chain, begin, po['pen_offset_mm'] / 1000.0,
+                          pen_axis, po['paper_rotation_deg'], po['paper_mirror_x'])
 
         Q = [P.joint_q(msg, chain.joint_names)
              for ts, msg in data['joint_states'] if ts >= draw_start]
@@ -119,10 +122,26 @@ def main():
             cmd_xyz = np.array([pf.cmd_paper_to_base_mm(p) for p in cmd])
         cmd_x, cmd_y, cmd_z = cmd_xyz[:, 0], cmd_xyz[:, 1], cmd_xyz[:, 2]
 
-    up = (po['pen_up_mm'] if po.get('pen_up_mm') is not None
-          else P.auto_pen_up_thresh(cmd_z))
-    cx, cy = P.break_on_pen_up(cmd_x, cmd_y, cmd_z, up)
-    fx, fy = P.break_on_pen_up(ex, ey, ez, up)
+    cmd_up = (po['pen_up_mm'] if po.get('pen_up_mm') is not None
+              else P.auto_pen_up_thresh(cmd_z))
+    # Executed z is in the same paper frame but may have a systematic offset vs
+    # commanded z (e.g. FK anchor drift, pen-offset mismatch). Use each stream's
+    # own auto threshold so the pen-down mask is self-calibrated per stream.
+    exec_up = P.auto_pen_up_thresh(ez) if ez.size > 0 else cmd_up
+    cx, cy = P.break_on_pen_up(cmd_x, cmd_y, cmd_z, cmd_up)
+    fx, fy = P.break_on_pen_up(ex, ey, ez, exec_up)
+
+    # Remove global registration offset (pen-frame calibration error) so the
+    # figure and RMS reflect pure tracking accuracy, not the paper-origin mismatch.
+    f_pen_down = np.isfinite(fx) & np.isfinite(fy)
+    c_pen_down = np.isfinite(cx) & np.isfinite(cy)
+    if f_pen_down.any() and c_pen_down.any():
+        dx = np.nanmean(fx[f_pen_down]) - np.nanmean(cx[c_pen_down])
+        dy = np.nanmean(fy[f_pen_down]) - np.nanmean(cy[c_pen_down])
+        fx = fx - dx
+        fy = fy - dy
+        print(f'registration offset removed: ({dx:+.1f}, {dy:+.1f}) mm')
+
     rms, mx, n = P.tracking_error(fx, fy, cx, cy)
 
     os.makedirs(args.outdir, exist_ok=True)

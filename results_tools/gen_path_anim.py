@@ -105,13 +105,32 @@ def main():
         w = data_io.time_mask(te, args.start, args.end)
         t = te[w]
         ex, ey, ez = _fk_to_plane(pf, chain, [Q[i] for i in np.where(w)[0]], args.frame)
-        cmd_x = cmd_y = cmd_z = None     # commanded path not joint-derived for a bag
+
+        # commanded guide from /cartesian_path if present
+        cmd_x = cmd_y = cmd_z = None
+        if data['cartesian_path'] and data['cartesian_path'][-1].poses:
+            pa = data['cartesian_path'][-1]
+            cmd_arr = np.array([[ps.position.x, ps.position.y, ps.position.z]
+                                for ps in pa.poses]) * 1000.0
+            cmd_x, cmd_y, cmd_z = cmd_arr[:, 0], cmd_arr[:, 1], cmd_arr[:, 2]
 
     t = t - t[0]
-    # pen-up breaking so lifted travel doesn't draw a connecting line
-    up = (po['pen_up_mm'] if po.get('pen_up_mm') is not None
-          else P.auto_pen_up_thresh(ez))
-    fx, fy = P.break_on_pen_up(ex, ey, ez, up)
+
+    # separate pen-up thresholds per stream (measured z may be offset from commanded)
+    exec_up = (po['pen_up_mm'] if po.get('pen_up_mm') is not None
+               else P.auto_pen_up_thresh(ez))
+    fx, fy = P.break_on_pen_up(ex, ey, ez, exec_up)
+
+    # remove registration offset so measured path aligns with commanded guide
+    if cmd_x is not None:
+        cmd_up = P.auto_pen_up_thresh(cmd_z)
+        f_down = np.isfinite(fx) & np.isfinite(fy)
+        c_down = cmd_z <= cmd_up
+        if f_down.any() and c_down.any():
+            dx = np.nanmean(fx[f_down]) - np.nanmean(cmd_x[c_down])
+            dy = np.nanmean(fy[f_down]) - np.nanmean(cmd_y[c_down])
+            fx = fx - dx
+            fy = fy - dy
 
     # ── frame schedule: one frame per 1/fps of (scaled) recorded time ────────
     duration = max(1e-3, (t[-1] - t[0]) / max(args.speed, 1e-6))
@@ -129,7 +148,8 @@ def main():
     ax.set_xlabel(f'{args.frame} X (mm)'); ax.set_ylabel(f'{args.frame} Y (mm)')
     ax.set_title('Drawing playback')
     if cmd_x is not None and not args.no_guide:
-        gx, gy = P.break_on_pen_up(cmd_x, cmd_y, cmd_z, up)
+        _cup = P.auto_pen_up_thresh(cmd_z) if cmd_z is not None else exec_up
+        gx, gy = P.break_on_pen_up(cmd_x, cmd_y, cmd_z, _cup)
         ax.plot(gx, gy, color='0.7', lw=1.0, ls='--', label='commanded (guide)', zorder=1)
     (drawn,) = ax.plot([], [], color='tab:red', lw=2.0, label='drawn', zorder=2)
     (pen,) = ax.plot([], [], 'o', color='tab:red', ms=8, zorder=3)

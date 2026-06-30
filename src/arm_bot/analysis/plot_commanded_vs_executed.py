@@ -315,21 +315,32 @@ def make_figure(cmd_x, cmd_y, exe_x, exe_y, out_path, frame_label,
     fig, ax = plt.subplots(figsize=(6.0, 6.0))
     ax.plot(cmd_x, cmd_y, '-', color='#1f77b4', lw=2.0, label='commanded', zorder=2)
     ax.plot(exe_x, exe_y, '-', color='#d62728', lw=1.2, alpha=0.85,
-            label='executed (FK of joint states)', zorder=3)
-    ax.set_aspect('equal', adjustable='datalim')
+            label='measured', zorder=3)
+    ax.set_aspect('equal', adjustable='box')
     ax.grid(True, ls=':', alpha=0.5)
     ax.set_xlabel(f'{frame_label} X (mm)')
     ax.set_ylabel(f'{frame_label} Y (mm)')
     ax.set_title(title)
-    cap = ''
-    if rms is not None and np.isfinite(rms):
-        cap = f'tracking error: RMS {rms:.2f} mm, max {mx:.2f} mm'
-        ax.text(0.02, 0.98, cap, transform=ax.transAxes, va='top', ha='left',
-                fontsize=9, bbox=dict(boxstyle='round', fc='white', ec='0.7', alpha=0.9))
+    # Add 20 % margin so the legend never sits on top of the path
+    x_all = np.concatenate([cmd_x[np.isfinite(cmd_x)], exe_x[np.isfinite(exe_x)]])
+    y_all = np.concatenate([cmd_y[np.isfinite(cmd_y)], exe_y[np.isfinite(exe_y)]])
+    if x_all.size and y_all.size:
+        pad = max(5.0, 0.20 * max(x_all.max() - x_all.min(), y_all.max() - y_all.min()))
+        cx_ = (x_all.min() + x_all.max()) / 2
+        cy_ = (y_all.min() + y_all.max()) / 2
+        half = max(x_all.max() - x_all.min(), y_all.max() - y_all.min()) / 2 + pad
+        ax.set_xlim(cx_ - half, cx_ + half)
+        ax.set_ylim(cy_ - half, cy_ + half)
     ax.legend(loc='lower right', framealpha=0.9)
     fig.tight_layout()
+    # Encode error metrics in the filename so they're readable without opening the image
+    cap = ''
+    if rms is not None and np.isfinite(rms):
+        cap = f'RMS{rms:.2f}mm_max{mx:.2f}mm'
+        stem, ext = os.path.splitext(out_path)
+        out_path = f'{stem}_{cap}{ext}'
     fig.savefig(out_path, dpi=300)
-    print(f'wrote {out_path}' + (f'  ({cap})' if cap else ''))
+    print(f'wrote {out_path}')
     if out_path.lower().endswith('.png'):
         pdf = out_path[:-4] + '.pdf'
         fig.savefig(pdf)

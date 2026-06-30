@@ -95,8 +95,8 @@ frontview:
   # world axis that points INTO the screen (it is dropped). The remaining two
   # axes map to screen-right (screen_x) and screen-up (screen_y).
   projection:
-    depth_axis: y                  # x | y | z  -> axis pointing into the screen
-    screen_x: x                    # world axis drawn to the right
+    depth_axis: x                  # x | y | z  -> axis pointing into the screen
+    screen_x: y                    # world axis drawn to the right
     screen_y: z                    # world axis drawn up
     flip_x: false
     flip_y: false
