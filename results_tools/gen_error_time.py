@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-gen_error_time.py — tracking error vs time.
+gen_error_time.py — positional accuracy error vs time.
 
-Same data as figure_4.1 (commanded path vs measured encoder path, centroid-
-aligned, pen-down only), but plotted as error (mm) on the Y axis and time (s)
-from drawing start on the X axis.
+Drawing mode: for each measured EE sample, find the nearest point on the
+commanded geometric path (paper frame) and report that distance — pure
+positional accuracy, independent of timing.
+
+Motion mode: same idea but in 3-D base-frame mm instead of paper mm.
 
     python3 results_tools/gen_error_time.py figures/draw_capture/bag
     python3 results_tools/gen_error_time.py figures/draw_capture/bag --show
@@ -42,6 +44,10 @@ def main():
     ap.add_argument('bag', help='rosbag2 directory')
     ap.add_argument('--outdir', default=data_io.figures_dir(cfg))
     ap.add_argument('--show', action='store_true')
+    ap.add_argument('--trim-idle', action='store_true',
+                    help='(motion mode) cut trailing idle tail where cmd is stationary')
+    ap.add_argument('--smooth-window', type=int, default=50,
+                    help='rolling-average window for smoothed figure (samples, default 50 ≈ 0.5 s)')
     args = ap.parse_args()
 
     if not args.show:
@@ -63,7 +69,9 @@ def main():
                 len(data['cartesian_path'][-1].poses) > 0)
 
     if has_path:
-        # ── DRAWING MODE: nearest-point to commanded polyline (paper frame) ──
+        # ── DRAWING MODE: nearest-point to commanded geometric path (paper frame) ──
+        # Measures pure positional accuracy: how far is the robot from the commanded
+        # path at each moment, regardless of when along the path it arrives.
         pa  = data['cartesian_path'][-1]
         cmd = np.array([[p.position.x, p.position.y, p.position.z]
                         for p in pa.poses]) * 1000.0
@@ -113,8 +121,8 @@ def main():
                 continue
             errors[i] = P.point_to_polyline_mm(ex[i], ey[i], poly_x, poly_y)
 
-        ylabel = 'Tracking error (mm)'
-        mode_label = 'commanded path vs measured (nearest-point)'
+        ylabel     = 'Positional error (mm)'
+        mode_label = 'nearest-point distance from measured EE to commanded path'
 
     else:
         # ── MOTION MODE: nearest-point on 3-D commanded EE path ──
@@ -129,6 +137,19 @@ def main():
 
         # FK the commanded joints → 3-D EE path (mm)
         cmd_pts = np.array([chain.fk(q)[:3, 3] * 1000.0 for q in q_cmd])  # (M, 3)
+
+        # trim idle tail: find last sample where commanded EE moved by >1 mm
+        if args.trim_idle:
+            dists = np.linalg.norm(np.diff(cmd_pts, axis=0), axis=1)
+            moving = np.where(dists > 1.0)[0]
+            if moving.size:
+                cut = moving[-1] + 2          # +1 for diff offset, +1 to include it
+                cut = min(cut, len(t_cmd))
+                t_cmd  = t_cmd[:cut]
+                q_cmd  = q_cmd[:cut]
+                cmd_pts = cmd_pts[:cut]
+                print(f'trim-idle: cut at t={t_cmd[-1]:.3f}s '
+                      f'({len(t_cmd)} cmd samples kept)')
 
         # trim measured to the overlap window so pre-start samples are excluded
         overlap = (t_meas >= t_cmd[0]) & (t_meas <= t_cmd[-1])
@@ -165,28 +186,29 @@ def main():
         mode_label = 'measured EE nearest-point on commanded 3-D path'
 
     pd_err = errors[np.isfinite(errors)]
-    rms = float(np.sqrt(np.mean(pd_err**2)))
-    mx  = float(np.max(pd_err))
+    rms_total = float(np.sqrt(np.mean(pd_err**2)))
+    mx_total  = float(np.max(pd_err))
     print(f'mode: {"drawing" if has_path else "motion"}')
-    print(f'samples: {len(pd_err)}   RMS: {rms:.3f} mm   max: {mx:.3f} mm')
+    print(f'samples: {len(pd_err)}   RMS: {rms_total:.3f} mm   max: {mx_total:.3f} mm')
 
     # ── plot ──────────────────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(10, 4))
 
-    t_valid = t_rel[np.isfinite(errors)]
-    e_valid = errors[np.isfinite(errors)]
+    valid = np.isfinite(errors)
+    t_valid = t_rel[valid]
+    e_valid = errors[valid]
 
     ax.plot(t_valid, e_valid, color='#1f77b4', lw=1.0)
-    ax.axhline(rms, ls='--', color='#d62728', lw=1.2, label=f'RMS {rms:.2f} mm')
-    ax.axhline(mx,  ls=':',  color='#ff7f0e', lw=1.2, label=f'max {mx:.2f} mm')
+    ax.axhline(rms_total, ls='--', color='#d62728', lw=1.2, label=f'RMS {rms_total:.2f} mm')
+    ax.axhline(mx_total,  ls=':',  color='#ff7f0e', lw=1.2, label=f'max {mx_total:.2f} mm')
 
     ax.set_xlabel('Time (s)', fontsize=11)
     ax.set_ylabel(ylabel, fontsize=11)
-    ax.set_xlim(t_valid[0], t_valid[-1])   # start at first data point, no leading gap
+    ax.set_xlim(t_valid[0], t_valid[-1])
     ax.set_ylim(0)
     ax.grid(True, ls=':', alpha=0.4)
-    ax.set_title(f'Commanded vs measured tracking error over time — '
-                 f'RMS {rms:.2f} mm, max {mx:.2f} mm', fontsize=11)
+    ax.set_title(f'Positional error over time — '
+                 f'RMS {rms_total:.2f} mm, max {mx_total:.2f} mm', fontsize=11)
     ax.legend(loc='lower right', fontsize=10)
     fig.tight_layout()
 
@@ -195,6 +217,38 @@ def main():
     fig.savefig(out, dpi=300)
     fig.savefig(out.replace('.png', '.pdf'))
     print(f'wrote {out}')
+
+    # ── smoothed version (separate file, raw kept as faint background) ────────
+    win = args.smooth_window
+    kernel = np.ones(win) / win
+    # 'valid' mode trims the edges where the window is incomplete
+    e_smooth = np.convolve(e_valid, kernel, mode='valid')
+    t_smooth = t_valid[win // 2: win // 2 + len(e_smooth)]
+
+    fig2, ax2 = plt.subplots(figsize=(10, 4))
+    ax2.plot(t_valid, e_valid, color='#1f77b4', lw=0.6, alpha=0.25, label='Raw')
+    ax2.plot(t_smooth, e_smooth, color='#1f77b4', lw=1.8,
+             label=f'Smoothed ({win}-sample rolling avg)')
+    ax2.axhline(rms_total, ls='--', color='#d62728', lw=1.2,
+                label=f'RMS {rms_total:.2f} mm')
+    ax2.axhline(mx_total,  ls=':',  color='#ff7f0e', lw=1.2,
+                label=f'max {mx_total:.2f} mm')
+
+    ax2.set_xlabel('Time (s)', fontsize=11)
+    ax2.set_ylabel(ylabel, fontsize=11)
+    ax2.set_xlim(t_valid[0], t_valid[-1])
+    ax2.set_ylim(0)
+    ax2.grid(True, ls=':', alpha=0.4)
+    ax2.set_title(f'Positional error over time (smoothed) — '
+                  f'RMS {rms_total:.2f} mm, max {mx_total:.2f} mm', fontsize=11)
+    ax2.legend(loc='lower right', fontsize=10)
+    fig2.tight_layout()
+
+    out2 = os.path.join(args.outdir, 'error_vs_time_smooth.png')
+    fig2.savefig(out2, dpi=300)
+    fig2.savefig(out2.replace('.png', '.pdf'))
+    print(f'wrote {out2}')
+
     if args.show:
         plt.show()
 

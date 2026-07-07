@@ -190,6 +190,8 @@ def main():
     ap.add_argument('--speed', type=float, default=1.0,
                     help='playback speed multiplier (1.0 = real time, 2.0 = 2× faster)')
     ap.add_argument('--stem', default='figure_position', help='output filename stem')
+    ap.add_argument('--trim-idle', action='store_true',
+                    help='cut trailing idle tail where commanded joints are stationary')
     args = ap.parse_args()
 
     if not args.export and not args.animate:
@@ -197,6 +199,18 @@ def main():
 
     outdir = args.outdir or data_io.figures_dir(cfg)
     t, cmd, meas, names = load(args.bag, cfg)
+
+    if args.trim_idle and cmd is not None:
+        # find last sample where any commanded joint moved by >0.005 rad (~0.3°)
+        diffs = np.abs(np.diff(cmd, axis=0))
+        moving_rows = np.where(np.any(diffs > 0.005, axis=1))[0]
+        if moving_rows.size:
+            cut = moving_rows[-1] + 2     # +1 for diff offset, +1 to include it
+            cut = min(cut, len(t))
+            t    = t[:cut]
+            cmd  = cmd[:cut]
+            meas = meas[:cut]
+            print(f'trim-idle: cut at t={t[-1]:.3f}s ({cut} samples kept)')
 
     if args.export:
         export_static(t, cmd, meas, names, outdir, args.stem)

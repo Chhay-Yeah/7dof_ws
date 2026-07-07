@@ -66,6 +66,10 @@ def main():
                     help='CSV mode: trim window start in t_rel seconds (just the drawing)')
     ap.add_argument('--end', type=float, default=None, help='CSV mode: trim window end (t_rel s)')
     ap.add_argument('--show', action='store_true')
+    ap.add_argument('--smooth', action='store_true',
+                    help='apply rolling average to measured path before plotting')
+    ap.add_argument('--smooth-window', type=int, default=50,
+                    help='rolling-average window in samples (default 50 ≈ 0.5 s)')
     args = ap.parse_args()
 
     if not args.show:
@@ -128,6 +132,18 @@ def main():
     # commanded z (e.g. FK anchor drift, pen-offset mismatch). Use each stream's
     # own auto threshold so the pen-down mask is self-calibrated per stream.
     exec_up = P.auto_pen_up_thresh(ez) if ez.size > 0 else cmd_up
+
+    # optional smoothing on measured path (before pen-up break so NaNs aren't smeared)
+    if args.smooth and ex.size > 0:
+        win = args.smooth_window
+        kernel = np.ones(win) / win
+        pad = win // 2
+        ex = np.convolve(ex, kernel, mode='same')
+        ey = np.convolve(ey, kernel, mode='same')
+        # edges are under-windowed — mask them out so they don't corrupt the circle ends
+        ex[:pad] = np.nan; ex[-pad:] = np.nan
+        ey[:pad] = np.nan; ey[-pad:] = np.nan
+
     cx, cy = P.break_on_pen_up(cmd_x, cmd_y, cmd_z, cmd_up)
     fx, fy = P.break_on_pen_up(ex, ey, ez, exec_up)
 
@@ -145,7 +161,8 @@ def main():
     rms, mx, n = P.tracking_error(fx, fy, cx, cy)
 
     os.makedirs(args.outdir, exist_ok=True)
-    out = os.path.join(args.outdir, po['export_stem'] + '.png')
+    stem = po['export_stem'] + ('_smooth' if args.smooth else '')
+    out = os.path.join(args.outdir, stem + '.png')
     P.make_figure(cx, cy, fx, fy, out, args.frame, rms, mx, show=args.show)
     print(f'\nexecuted samples scored: {n}')
     if np.isfinite(rms):
